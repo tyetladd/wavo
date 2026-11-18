@@ -236,6 +236,7 @@ mod ane;
 mod conformer;
 mod cpu;
 mod error;
+mod external;
 mod fft;
 mod gguf;
 mod gigaam;
@@ -256,6 +257,7 @@ use std::path::Path;
 use ane::Target;
 use error::bail;
 pub use error::{Error, Result};
+pub use external::Encoder;
 pub use gpu::{Api, Device, DeviceKind, Kernels};
 pub use split::split;
 
@@ -580,6 +582,50 @@ impl Model {
       ),
     };
     Ok(Self { family, languages })
+  }
+
+  /// Loads a GigaAM model with its encoder in another runtime: `encoder` runs the encoder (see
+  /// [`Encoder`] for what it computes), and wavo the frontend, the decoder, the tokenizer and
+  /// everything [`transcribe_long`](Self::transcribe_long) does around them. The file's own
+  /// encoder weights stay unread. [`device`](Self::device) is the encoder's.
+  ///
+  /// # Errors
+  ///
+  /// - [`Error::Io`]: the file can't be read.
+  /// - [`Error::Model`]: the file isn't a valid GGUF model, or it is not GigaAM: only GigaAM takes
+  ///   an outside encoder.
+  ///
+  /// # Examples
+  ///
+  /// ```no_run
+  /// use wavo::{Device, Encoder, Model};
+  ///
+  /// struct Zeros(Device);
+  /// impl Encoder for Zeros {
+  ///   fn encode(&self, mel: &[f32], mels: usize) -> Result<Vec<f32>, String> {
+  ///     let t = ((mel.len() / mels - 1) / 2) / 2 + 1;
+  ///     Ok(vec![0.0; t * 320])
+  ///   }
+  ///   fn device(&self) -> &Device {
+  ///     &self.0
+  ///   }
+  /// }
+  ///
+  /// let on = Box::new(Zeros(Device::external("CPU", "zeros", false)));
+  /// let model = Model::load_external("gigaam-v3-e2e-rnnt-Q8_0.gguf", on)?;
+  /// # Ok::<(), wavo::Error>(())
+  /// ```
+  pub fn load_external(path: impl AsRef<Path>, encoder: Box<dyn Encoder>) -> Result<Self> {
+    let g = gguf::Gguf::open(path.as_ref())?;
+    let languages = g.optional_array::<&str>("general.languages")?;
+    let languages = languages.into_iter().map(str::to_string).collect();
+    match g.get::<&str>("general.architecture")? {
+      "gigaam" => {
+        let model = gigaam::Gigaam::load(&g, Target::External(encoder))?;
+        Ok(Self { family: Family::Gigaam(Box::new(model)), languages })
+      }
+      arch => bail!("general.architecture is {arch:?}: only gigaam takes an outside encoder"),
+    }
   }
 
   /// Transcribes 16 kHz mono PCM samples in [-1, 1], passed to the model as they are, in one pass.

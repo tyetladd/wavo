@@ -749,3 +749,36 @@ fn moonshine_tiny_cpu() {
 fn moonshine_base_cpu() {
   check_on("moonshine-base", wavo::Backend::Cpu, ENGLISH);
 }
+
+/// `Model::load_external`: wavo hands the encoder its mel `[frames][mels]`, decodes what comes
+/// back (zeros: the blank wins every frame, so no text), and reports the encoder's device; a
+/// family other than GigaAM is refused.
+#[test]
+fn gigaam_takes_an_outside_encoder() {
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  struct Zeros(wavo::Device, AtomicUsize);
+  impl wavo::Encoder for Zeros {
+    fn encode(&self, mel: &[f32], mels: usize) -> Result<Vec<f32>, String> {
+      assert_eq!((mels, mel.len() % mels), (64, 0));
+      let half = |n: usize| (n - 1) / 2 + 1;
+      self.1.fetch_add(1, Ordering::Relaxed);
+      Ok(vec![0.0; half(half(mel.len() / mels)) * 320])
+    }
+    fn device(&self) -> &wavo::Device {
+      &self.0
+    }
+  }
+  let encoder = Box::new(Zeros(wavo::Device::external("CPU", "zeros", false), AtomicUsize::new(0)));
+  let model = wavo::Model::load_external(model_path("gigaam-v3-e2e-rnnt"), encoder).unwrap();
+  assert_eq!(model.device().to_string(), "CPU (zeros)");
+  assert_eq!(model.device().api, wavo::Api::External);
+  let transcript = model.transcribe(&vec![0.01; 3 * 16000]).unwrap();
+  assert_eq!(transcript.text, "");
+
+  let parakeet = wavo::Model::load_external(
+    model_path("parakeet-ultra"),
+    Box::new(Zeros(wavo::Device::external("CPU", "zeros", false), AtomicUsize::new(0))),
+  );
+  let e = parakeet.err().unwrap().to_string();
+  assert!(e.contains("only gigaam"), "{e}");
+}

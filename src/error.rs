@@ -59,6 +59,10 @@ pub enum Error {
   /// [prepared](crate::Model::prepare), or Core ML failed to compile, load or run it.
   #[error("Neural Engine: {0}")]
   NeuralEngine(String),
+  /// An [`Encoder`](crate::Encoder) of [`Model::load_external`](crate::Model::load_external)
+  /// failed: its own message.
+  #[error("encoder: {0}")]
+  Encoder(String),
   /// A progress callback returned [`ControlFlow::Break`](std::ops::ControlFlow::Break): the one
   /// of [`Model::prepare`](crate::Model::prepare), of
   /// [`Model::transcribe_long`](crate::Model::transcribe_long), or with the `hub` feature of

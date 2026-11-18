@@ -65,11 +65,13 @@ pub fn device() -> &'static Device {
   })
 }
 
-/// Where a family's encoder runs: the GPU (`E`), the Neural Engine's program, or the CPU (`C`).
+/// Where a family's encoder runs: the GPU (`E`), the Neural Engine's program, the CPU (`C`), or
+/// another runtime (GigaAM only, `Model::load_external`).
 pub enum Backend<E, C> {
   Gpu(Box<(Gpu, E)>),
   Ane(Model),
   Cpu(Box<C>),
+  External(Box<dyn crate::Encoder>),
 }
 
 /// Where `Model::load_with` loads a family's encoder.
@@ -78,6 +80,7 @@ pub enum Target {
   Gpu(Option<usize>),
   Ane(Model),
   Cpu,
+  External(Box<dyn crate::Encoder>),
 }
 
 impl<E, C> Backend<E, C> {
@@ -95,6 +98,7 @@ impl<E, C> Backend<E, C> {
       }
       Target::Ane(model) => Self::Ane(model),
       Target::Cpu => Self::Cpu(Box::new(cpu()?)),
+      Target::External(encoder) => Self::External(encoder),
     })
   }
 
@@ -103,6 +107,7 @@ impl<E, C> Backend<E, C> {
       Self::Gpu(gpu) => gpu.0.info(),
       Self::Ane(_) => device(),
       Self::Cpu(_) => crate::cpu::device(),
+      Self::External(encoder) => encoder.device(),
     }
   }
 }

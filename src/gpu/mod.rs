@@ -64,6 +64,9 @@ pub enum Api {
   CoreMl,
   /// None: wavo's own kernels on the CPU ([`Backend::Cpu`](crate::Backend::Cpu)).
   Cpu,
+  /// Another runtime's: an [`Encoder`](crate::Encoder) loaded with
+  /// [`Model::load_external`](crate::Model::load_external).
+  External,
 }
 
 /// The kind of adapter a [`Device`] is, as the driver reports it.
@@ -104,6 +107,8 @@ pub enum Kernels {
   CoreMl,
   /// wavo's kernels on the [`Cpu`](DeviceKind::Cpu): AVX2 and FMA on x86_64, NEON on ARM.
   Cpu,
+  /// No wavo kernels: an [`Encoder`](crate::Encoder) of another runtime runs the encoder.
+  External,
 }
 
 /// The GPU adapters for [`crate::devices`], the one `adapter()` picks first, at least up to
@@ -195,7 +200,7 @@ impl std::fmt::Display for Device {
       Api::Vulkan => "Vulkan",
       Api::Dx12 => "DX12",
       Api::CoreMl => "Core ML",
-      Api::Cpu => return write!(f, "{} ({})", self.name, self.driver),
+      Api::Cpu | Api::External => return write!(f, "{} ({})", self.name, self.driver),
     };
     let kind = match self.kind {
       DeviceKind::DiscreteGpu => "discrete",

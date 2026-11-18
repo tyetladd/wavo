@@ -196,6 +196,7 @@ impl Whisper {
       }
       Backend::Cpu(c) => Run::Cpu(c, None),
       Backend::Ane(_) => unreachable!("Whisper has no Neural Engine program"),
+      Backend::External(_) => unreachable!("Model::load_external takes GigaAM only"),
     }
   }
 

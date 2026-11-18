@@ -145,6 +145,9 @@ impl Gigaam {
       Backend::Gpu(gpu) => gpu.1.run(&gpu.0, &mel)?,
       Backend::Ane(model) => ane::run(model, &mel, self.frontend.mels())?,
       Backend::Cpu(encoder) => encoder.run(&mel),
+      Backend::External(encoder) => {
+        encoder.encode(&mel, self.frontend.mels()).map_err(crate::Error::Encoder)?
+      }
     };
     let ids = match &self.head {
       Head::Rnnt(decoder) => decoder.decode(&enc),

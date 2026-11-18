@@ -162,6 +162,7 @@ impl Moonshine {
           .greedy(|token, pos| Ok(argmax(&on.decoder.step(&mut cache, token, pos, Some(&table)))))?
       }
       Backend::Ane(_) => unreachable!("Moonshine has no Neural Engine program"),
+      Backend::External(_) => unreachable!("Model::load_external takes GigaAM only"),
     };
     let pieces = self.tok.pieces(&ids);
     let text = sentencepiece::text(&pieces);
