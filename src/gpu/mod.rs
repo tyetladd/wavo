@@ -495,7 +495,9 @@ impl Gpu {
         max_buffer_size: supported.max_buffer_size,
         max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_compute_workgroup_storage_size: supported.max_compute_workgroup_storage_size,
-        ..Default::default()
+        // The defaults, but never past what the adapter has: iOS's simulator offers 15
+        // inter-stage shader variables where the default asks for 16, and the device then fails.
+        ..wgpu::Limits::default().or_worse_values_from(&supported)
       },
       // SAFETY: cooperative matrices are only used by the bundled kernels, after a probe.
       experimental_features: if fast {
