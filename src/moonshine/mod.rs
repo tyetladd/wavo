@@ -32,6 +32,9 @@ pub struct Moonshine {
   /// The decoder's positions.
   context: usize,
   backend: Backend<OnGpu, OnCpu>,
+  /// The CPU's decoder, beside an outside encoder
+  /// ([`Model::load_external`](crate::Model::load_external)).
+  external: Option<on_cpu::Decoder>,
 }
 
 struct OnGpu {
@@ -139,8 +142,12 @@ impl Moonshine {
       let encoder = cpu::Encoder::load(g, config("encoder")?, eps)?;
       Ok(OnCpu { encoder, decoder: on_cpu::Decoder::load(g, config("decoder")?, vocab, context)? })
     };
+    let external = match target {
+      Target::External(_) => Some(on_cpu::Decoder::load(g, config("decoder")?, vocab, context)?),
+      _ => None,
+    };
     let backend = Backend::new(target, gpu, cpu)?;
-    Ok(Self { tok, bos, eos, freqs, context, backend })
+    Ok(Self { tok, bos, eos, freqs, context, backend, external })
   }
 
   pub fn device(&self) -> &crate::Device {
@@ -162,7 +169,21 @@ impl Moonshine {
           .greedy(|token, pos| Ok(argmax(&on.decoder.step(&mut cache, token, pos, Some(&table)))))?
       }
       Backend::Ane(_) => unreachable!("Moonshine has no Neural Engine program"),
-      Backend::External(_) => unreachable!("Model::load_external takes GigaAM only"),
+      Backend::External(encoder) => {
+        let decoder = self.external.as_ref().expect("an outside encoder loads the CPU's decoder");
+        // The samples themselves, as one band.
+        let enc = encoder.encode(pcm, 1).map_err(crate::Error::Encoder)?;
+        if enc.len() != t * decoder.cfg.d {
+          return Err(crate::Error::Encoder(format!(
+            "{} outputs, not {t} frames of {}",
+            enc.len(),
+            decoder.cfg.d
+          )));
+        }
+        let table = self.table(t.max(self.context));
+        let mut cache = decoder.cache(&enc, t);
+        self.greedy(|token, pos| Ok(argmax(&decoder.step(&mut cache, token, pos, Some(&table)))))?
+      }
     };
     let pieces = self.tok.pieces(&ids);
     let text = sentencepiece::text(&pieces);

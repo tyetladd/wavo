@@ -1,7 +1,8 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 //! An encoder that runs outside wavo, for [`Model::load_external`](crate::Model::load_external):
-//! the caller's own runtime (MNN, LiteRT or another) runs GigaAM's, Parakeet's or Whisper's
-//! encoder, and wavo keeps the frontend, the decoder, the splitting at pauses and the token times.
+//! the caller's own runtime (MNN, LiteRT or another) runs a family's encoder (GigaAM, Parakeet,
+//! Whisper, Moonshine), and wavo keeps the frontend, the decoder, the splitting at pauses and the
+//! token times.
 
 use crate::gpu::Device;
 
@@ -11,7 +12,9 @@ use crate::gpu::Device;
 /// the Conformer blocks with relative positions and the joint's encoder projection. Whisper's
 /// (`src/whisper/cpu.rs`): a 30 s window of mel `[3000][mels]` through the two conv1d + GELU, the
 /// learned positions, the blocks and the final LayerNorm, returning `[1500][d]`, which wavo's CPU
-/// decoder attends to. wavo calls it from the thread that calls
+/// decoder attends to. Moonshine's (`src/moonshine/cpu.rs`): the samples themselves, `mels` 1,
+/// through the conv stem and the blocks with partial RoPE, returning `[t][d]`. wavo calls it from
+/// the thread that calls
 /// [`Model::transcribe`](crate::Model::transcribe), one call at a time.
 pub trait Encoder: Send + Sync {
   /// Encodes `mel`, time-major `[frames][mels]` (wavo's log-mel features), and returns the head's

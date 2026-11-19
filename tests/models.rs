@@ -813,6 +813,25 @@ fn gigaam_takes_an_outside_encoder() {
   assert_eq!(whisper.device().to_string(), "CPU (states zeros)");
   whisper.transcribe(&vec![0.01; 3 * 16000]).unwrap();
 
+  // Moonshine: the samples themselves as one band, its encoder frames of the model's width out.
+  struct Frames(wavo::Device);
+  impl wavo::Encoder for Frames {
+    fn encode(&self, pcm: &[f32], mels: usize) -> Result<Vec<f32>, String> {
+      assert_eq!((mels, pcm.len()), (1, 3 * 16000));
+      let conv = |n: usize, k: usize, s: usize| (n - k) / s + 1;
+      Ok(vec![0.0; conv(conv(conv(pcm.len(), 127, 64), 7, 3), 3, 2) * 416])
+    }
+    fn device(&self) -> &wavo::Device {
+      &self.0
+    }
+  }
+  let moonshine = wavo::Model::load_external(
+    model_path("moonshine-base"),
+    Box::new(Frames(wavo::Device::external("CPU", "frames zeros", false))),
+  )
+  .unwrap();
+  moonshine.transcribe(&vec![0.01; 3 * 16000]).unwrap();
+
   let encoder = Joint(wavo::Device::external("CPU", "joint zeros", false), AtomicUsize::new(0));
   let parakeet =
     wavo::Model::load_external(model_path("parakeet-ultra"), Box::new(encoder)).unwrap();
