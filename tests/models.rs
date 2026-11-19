@@ -751,8 +751,8 @@ fn moonshine_base_cpu() {
 }
 
 /// `Model::load_external`: wavo hands the encoder its mel `[frames][mels]`, decodes what comes
-/// back (zeros: the blank wins every frame, so no text), and reports the encoder's device; a
-/// family other than GigaAM is refused.
+/// back (zeros: the blank wins every frame, so no text), and reports the encoder's device; GigaAM's
+/// and Parakeet's, which also gets how many frames are valid.
 #[test]
 fn gigaam_takes_an_outside_encoder() {
   use std::sync::atomic::{AtomicUsize, Ordering};
@@ -775,10 +775,27 @@ fn gigaam_takes_an_outside_encoder() {
   let transcript = model.transcribe(&vec![0.01; 3 * 16000]).unwrap();
   assert_eq!(transcript.text, "");
 
-  let parakeet = wavo::Model::load_external(
-    model_path("parakeet-ultra"),
-    Box::new(Zeros(wavo::Device::external("CPU", "zeros", false), AtomicUsize::new(0))),
-  );
-  let e = parakeet.err().unwrap().to_string();
-  assert!(e.contains("only gigaam"), "{e}");
+  // Parakeet: 128 mels, frames halved three times, the joint's width; parakeet-ultra masks with
+  // kestrel, so one frame fewer than the mel has is valid.
+  struct Joint(wavo::Device, AtomicUsize);
+  impl wavo::Encoder for Joint {
+    fn encode(&self, _: &[f32], _: usize) -> Result<Vec<f32>, String> {
+      Err("Parakeet calls encode_masked".into())
+    }
+    fn encode_masked(&self, mel: &[f32], mels: usize, valid: usize) -> Result<Vec<f32>, String> {
+      assert_eq!((mels, mel.len() % mels), (128, 0));
+      assert_eq!(valid, mel.len() / mels - 1, "kestrel: all but the last frame");
+      let half = |n: usize| (n - 1) / 2 + 1;
+      self.1.fetch_add(1, Ordering::Relaxed);
+      Ok(vec![0.0; half(half(half(mel.len() / mels))) * 640])
+    }
+    fn device(&self) -> &wavo::Device {
+      &self.0
+    }
+  }
+  let encoder = Joint(wavo::Device::external("CPU", "joint zeros", false), AtomicUsize::new(0));
+  let parakeet =
+    wavo::Model::load_external(model_path("parakeet-ultra"), Box::new(encoder)).unwrap();
+  assert_eq!(parakeet.device().to_string(), "CPU (joint zeros)");
+  assert_eq!(parakeet.transcribe(&vec![0.01; 3 * 16000]).unwrap().text, "");
 }

@@ -35,6 +35,8 @@ pub struct Parakeet {
   special: Vec<bool>,
   /// kestrel length masking: the mel frames past `pcm.len() / HOP` are padding.
   kestrel: bool,
+  /// The joint's hidden size: an outside encoder's rows are this wide.
+  joint: usize,
 }
 
 /// Encoder frames of `mel_frames` mel frames: three stride-2 convs over all but the last mel frame,
@@ -118,7 +120,7 @@ impl Parakeet {
       Ok::<_, Error>((backend, decoder.join().unwrap()?))
     })?;
     let tok = Tokenizer::new(&vocab);
-    Ok(Self { backend, frontend: Frontend::new(), decoder, tok, special, kestrel })
+    Ok(Self { backend, frontend: Frontend::new(), decoder, tok, special, kestrel, joint })
   }
 
   pub fn device(&self) -> &crate::Device {
@@ -136,7 +138,15 @@ impl Parakeet {
       Backend::Gpu(gpu) => gpu.1.run(&gpu.0, &mel, valid)?,
       Backend::Ane(model) => ane::run(model, &mel, valid)?,
       Backend::Cpu(encoder) => encoder.run(&mel, valid),
-      Backend::External(_) => unreachable!("Model::load_external takes GigaAM only"),
+      Backend::External(encoder) => {
+        let enc = encoder.encode_masked(&mel, MELS, valid).map_err(crate::Error::Encoder)?;
+        let t = encoder_frames(mel.len() / MELS);
+        if enc.len() != t * self.joint {
+          let want = format!("{t} frames of {}", self.joint);
+          return Err(crate::Error::Encoder(format!("{} outputs, not {want}", enc.len())));
+        }
+        (enc, self.joint)
+      }
     };
     let (ids, frames): (Vec<usize>, Vec<u32>) = (self.decoder.decode(&enc, width).into_iter())
       .filter(|&(id, _)| !self.special[id as usize])

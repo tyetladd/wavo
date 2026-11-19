@@ -584,16 +584,16 @@ impl Model {
     Ok(Self { family, languages })
   }
 
-  /// Loads a GigaAM model with its encoder in another runtime: `encoder` runs the encoder (see
-  /// [`Encoder`] for what it computes), and wavo the frontend, the decoder, the tokenizer and
-  /// everything [`transcribe_long`](Self::transcribe_long) does around them. The file's own
-  /// encoder weights stay unread. [`device`](Self::device) is the encoder's.
+  /// Loads a GigaAM or Parakeet model with its encoder in another runtime: `encoder` runs the
+  /// encoder (see [`Encoder`] for what it computes), and wavo the frontend, the decoder, the
+  /// tokenizer and everything [`transcribe_long`](Self::transcribe_long) does around them. The
+  /// file's own encoder weights stay unread. [`device`](Self::device) is the encoder's.
   ///
   /// # Errors
   ///
   /// - [`Error::Io`]: the file can't be read.
-  /// - [`Error::Model`]: the file isn't a valid GGUF model, or it is not GigaAM: only GigaAM takes
-  ///   an outside encoder.
+  /// - [`Error::Model`]: the file isn't a valid GGUF model, or it is neither GigaAM nor Parakeet:
+  ///   only they take an outside encoder.
   ///
   /// # Examples
   ///
@@ -624,7 +624,13 @@ impl Model {
         let model = gigaam::Gigaam::load(&g, Target::External(encoder))?;
         Ok(Self { family: Family::Gigaam(Box::new(model)), languages })
       }
-      arch => bail!("general.architecture is {arch:?}: only gigaam takes an outside encoder"),
+      "parakeet" => {
+        let model = parakeet::Parakeet::load(&g, Target::External(encoder))?;
+        Ok(Self { family: Family::Parakeet(Box::new(model)), languages })
+      }
+      arch => {
+        bail!("general.architecture is {arch:?}: only gigaam and parakeet take an outside encoder")
+      }
     }
   }
 
