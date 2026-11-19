@@ -584,8 +584,8 @@ impl Model {
     Ok(Self { family, languages })
   }
 
-  /// Loads a GigaAM or Parakeet model with its encoder in another runtime: `encoder` runs the
-  /// encoder (see [`Encoder`] for what it computes), and wavo the frontend, the decoder, the
+  /// Loads a GigaAM, Parakeet or Whisper model with its encoder in another runtime: `encoder` runs
+  /// the encoder (see [`Encoder`] for what it computes), and wavo the frontend, the decoder, the
   /// tokenizer and everything [`transcribe_long`](Self::transcribe_long) does around them. The
   /// file's own encoder weights stay unread. [`device`](Self::device) is the encoder's.
   ///
@@ -628,9 +628,13 @@ impl Model {
         let model = parakeet::Parakeet::load(&g, Target::External(encoder))?;
         Ok(Self { family: Family::Parakeet(Box::new(model)), languages })
       }
-      arch => {
-        bail!("general.architecture is {arch:?}: only gigaam and parakeet take an outside encoder")
+      "whisper" => {
+        let model = whisper::Whisper::load(&g, Target::External(encoder))?;
+        Ok(Self { family: Family::Whisper(Box::new(model)), languages })
       }
+      arch => bail!(
+        "general.architecture is {arch:?}: only gigaam, parakeet and whisper take an outside encoder"
+      ),
     }
   }
 

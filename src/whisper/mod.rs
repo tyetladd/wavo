@@ -43,6 +43,9 @@ pub struct Whisper {
   languages: Vec<usize>,
   mels: usize,
   backend: Backend<OnGpu, OnCpu>,
+  /// The CPU's decoder, beside an outside encoder
+  /// ([`Model::load_external`](crate::Model::load_external)).
+  external: Option<on_cpu::Decoder>,
 }
 
 struct OnGpu {
@@ -60,6 +63,8 @@ struct OnCpu {
 enum Run<'a> {
   Gpu(&'a Gpu, &'a OnGpu, MutexGuard<'a, Arena>),
   Cpu(&'a OnCpu, Option<Cache>),
+  /// An outside encoder and the CPU's decoder.
+  External(&'a dyn crate::Encoder, &'a on_cpu::Decoder, Option<Cache>),
 }
 
 /// Activations, caches and the bind groups recorded over them, one list per kind of pass.
@@ -172,7 +177,12 @@ impl Whisper {
       let encoder = cpu::Encoder::load(g, cfg(), config("encoder")?)?;
       Ok(OnCpu { encoder, decoder: on_cpu::Decoder::load(g, config("decoder")?, vocab, context)? })
     };
+    let external = match target {
+      Target::External(_) => Some(on_cpu::Decoder::load(g, config("decoder")?, vocab, context)?),
+      _ => None,
+    };
     Ok(Self {
+      external,
       sot: u("sot_token_id")?,
       transcribe: u("transcribe_token_id")?,
       no_speech: no_timestamps - 1,
@@ -196,7 +206,10 @@ impl Whisper {
       }
       Backend::Cpu(c) => Run::Cpu(c, None),
       Backend::Ane(_) => unreachable!("Whisper has no Neural Engine program"),
-      Backend::External(_) => unreachable!("Model::load_external takes GigaAM only"),
+      Backend::External(encoder) => {
+        let decoder = self.external.as_ref().expect("an outside encoder loads the CPU's decoder");
+        Run::External(encoder.as_ref(), decoder, None)
+      }
     }
   }
 
@@ -285,6 +298,19 @@ impl Whisper {
         let c = cache.insert(on.decoder.cache(&enc, FRAMES));
         return Ok(on.decoder.step(c, self.sot, 0, None));
       }
+      Run::External(encoder, decoder, cache) => {
+        let enc = encoder.encode(mel, self.mels).map_err(crate::Error::Encoder)?;
+        let want = FRAMES * decoder.cfg.d;
+        if enc.len() != want {
+          return Err(crate::Error::Encoder(format!(
+            "{} outputs, not {FRAMES} frames of {}",
+            enc.len(),
+            decoder.cfg.d
+          )));
+        }
+        let c = cache.insert(decoder.cache(&enc, FRAMES));
+        return Ok(decoder.step(c, self.sot, 0, None));
+      }
     };
     let Arena { enc, dec, ids, read, window, .. } = a;
     gpu.write(&enc.mel, mel);
@@ -309,6 +335,15 @@ impl Whisper {
         let mut logits = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
           logits = on.decoder.step(c, token, pos + i, None);
+        }
+
+        return Ok(logits);
+      }
+      Run::External(_, decoder, cache) => {
+        let c = cache.as_mut().expect("a window before its steps");
+        let mut logits = Vec::new();
+        for (i, &token) in tokens.iter().enumerate() {
+          logits = decoder.step(c, token, pos + i, None);
         }
 
         return Ok(logits);

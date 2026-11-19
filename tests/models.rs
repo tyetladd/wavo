@@ -793,6 +793,26 @@ fn gigaam_takes_an_outside_encoder() {
       &self.0
     }
   }
+  // Whisper: a 30 s window of 80 mels in, 1500 rows of the model's width out; zeros decode to
+  // nothing, through the CPU's decoder.
+  struct States(wavo::Device);
+  impl wavo::Encoder for States {
+    fn encode(&self, mel: &[f32], mels: usize) -> Result<Vec<f32>, String> {
+      assert_eq!((mels, mel.len()), (80, 3000 * 80));
+      Ok(vec![0.0; 1500 * 768])
+    }
+    fn device(&self) -> &wavo::Device {
+      &self.0
+    }
+  }
+  let whisper = wavo::Model::load_external(
+    model_path("whisper-small"),
+    Box::new(States(wavo::Device::external("CPU", "states zeros", false))),
+  )
+  .unwrap();
+  assert_eq!(whisper.device().to_string(), "CPU (states zeros)");
+  whisper.transcribe(&vec![0.01; 3 * 16000]).unwrap();
+
   let encoder = Joint(wavo::Device::external("CPU", "joint zeros", false), AtomicUsize::new(0));
   let parakeet =
     wavo::Model::load_external(model_path("parakeet-ultra"), Box::new(encoder)).unwrap();
