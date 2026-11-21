@@ -110,7 +110,10 @@ impl Trie {
       if boundary(c) {
         let phrase = c == '▁' || c.is_whitespace();
         match ctx.node.filter(|&n| n != 0 && phrase).and_then(|n| self.child(n, ' ')) {
-          Some(n) => ctx.node = Some(n),
+          Some(n) => {
+            ctx.node = Some(n);
+            (ctx.spaced, ctx.gap) = (true, true);
+          }
           None => {
             delta -= ctx.open();
             ctx = Ctx::START;
@@ -119,6 +122,15 @@ impl Trie {
         continue;
       }
       let lower = c.to_lowercase().next().unwrap_or(c);
+      // Past a space in a phrase, a letter the phrase doesn't go on with ends it there: the
+      // words before keep what they earned, and a word starting here starts from the tree's
+      // root, not as their case ending (`докер образ` with `докер компоуз`, `докер` lost its
+      // bonus at `обра` and kept it at `обз`).
+      if ctx.spaced && ctx.node.and_then(|n| self.child(n, lower)).is_none() {
+        delta -= ctx.open();
+        ctx = if ctx.gap { Ctx::START } else { Ctx::OFF };
+      }
+      ctx.gap = false;
       match ctx.node.and_then(|n| self.child(n, lower)) {
         Some(n) => {
           delta += boost;
@@ -150,17 +162,21 @@ const TAIL: u8 = 3;
 /// Where a hypothesis is in the tree: `node` while its current word follows a word from the
 /// start (`Some(0)` at a word's start), `None` in a case ending or off the tree until the next
 /// boundary; `word` the bonus the word got, `kept` how much of it a word end or stem has
-/// earned, and `tail` the letters after the last of them.
+/// earned, and `tail` the letters after the last of them; `spaced` once a phrase went past a
+/// space, `gap` right after it.
 #[derive(Clone, Copy, Debug)]
 struct Ctx {
   node: Option<u32>,
   word: f32,
   kept: Option<f32>,
   tail: u8,
+  spaced: bool,
+  gap: bool,
 }
 
 impl Ctx {
-  const START: Ctx = Ctx { node: Some(0), word: 0.0, kept: None, tail: 0 };
+  const START: Ctx =
+    Ctx { node: Some(0), word: 0.0, kept: None, tail: 0, spaced: false, gap: false };
   const OFF: Ctx = Ctx { node: None, ..Ctx::START };
 
   /// The bonus taken back if the word ended here.
@@ -505,6 +521,17 @@ mod tests {
     let ids: Vec<u32> =
       ctc(&l, vocab.len(), 0, &texts, &trie, 1.5, 8).iter().map(|t| t.0).collect();
     assert_eq!(ids, [2, 3, 4]);
+  }
+
+  #[test]
+  fn a_word_after_a_phrase_that_turned_off_is_no_case_ending() {
+    let trie = Trie::new(&["докер".to_string(), "докер компоуз".to_string()]);
+    let bonus = |text: &str| trie.advance(Ctx::START, &text.chars().collect::<Vec<_>>(), 1.0).1;
+    assert_eq!(bonus("докер▁образ▁"), 5.0);
+    assert_eq!(bonus("докер▁обз▁"), 5.0);
+    assert_eq!(bonus("докер▁кот▁"), 5.0);
+    assert_eq!(bonus("докер▁компоуз▁"), 12.0);
+    assert_eq!(bonus("докер▁докер▁"), 10.0);
   }
 
   #[test]
