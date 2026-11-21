@@ -44,6 +44,8 @@ at a time: port it, match the reference exactly, make it fast, move on. Tick a p
 
 Open:
 
+- **Hotwords:** `Options::hotwords` favours the caller's words in the decoder; CTC done, RNN-T
+  and Parakeet TDT next. [Plan](plans/20261121-hotwords.md)
 - **Moonshine:** fast (phase 16), the language fine-tunes (17), the streaming variants one-shot
   (18, optional). [Plan](plans/20261011-moonshine.md)
 - **Fast kernels beyond Apple.** The GEMM on F16 16×16 cooperative matrices runs on NVIDIA

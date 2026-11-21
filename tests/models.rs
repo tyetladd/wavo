@@ -419,6 +419,23 @@ fn gigaam_v3_e2e_rnnt() {
 fn gigaam_v3_e2e_ctc() {
   check("gigaam-v3-e2e-ctc", GIGAAM);
   too_long("gigaam-v3-e2e-ctc", "ru-long");
+  hotwords_unheard("gigaam-v3-e2e-ctc", GIGAAM);
+}
+
+/// Hotwords the samples don't say leave their transcripts as greedy decoding writes them, text
+/// and tokens.
+fn hotwords_unheard(name: &str, samples: &[&str]) {
+  let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
+  let model = wavo::Model::load_with(model_path(name), wavo::Backend::Gpu).unwrap();
+  assert!(model.takes_hotwords(), "{name}");
+  let mut options = wavo::Options::default();
+  options.hotwords =
+    Some(wavo::Hotwords::new(["кубернетес", "докер", "эс эс эйч", "GigaAM", "паракит"]));
+  for sample in samples {
+    let pcm = read_sample(sample);
+    let greedy = model.transcribe(&pcm).unwrap();
+    assert_eq!(model.transcribe_with(&pcm, &options).unwrap(), greedy, "{name} {sample}");
+  }
 }
 
 #[test]

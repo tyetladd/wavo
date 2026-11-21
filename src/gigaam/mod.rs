@@ -6,7 +6,7 @@
 
 pub mod ane;
 mod cpu;
-mod decoder;
+pub(crate) mod decoder;
 mod encoder;
 mod frontend;
 
@@ -38,6 +38,8 @@ pub struct Gigaam {
   tok: Tokenizer,
   /// A character vocabulary (`ctc`, `rnnt`): words have no `▁`, a space token goes between them.
   chars: bool,
+  /// Each token's text, for [`crate::hotwords`].
+  texts: Vec<Vec<char>>,
 }
 
 /// The encoder's checked metadata.
@@ -125,7 +127,8 @@ impl Gigaam {
       },
       || cpu::Encoder::new(g, config(g)?),
     )?;
-    Ok(Self { backend, frontend, head, tok, chars })
+    let texts = (0..tok.len()).map(|id| tok.pieces(&[id])[0].chars().collect()).collect();
+    Ok(Self { backend, frontend, head, tok, chars, texts })
   }
 
   pub fn chars(&self) -> bool {
@@ -136,7 +139,12 @@ impl Gigaam {
     self.backend.device()
   }
 
-  pub fn transcribe(&self, pcm: &[f32]) -> Result<Transcript> {
+  /// Whether the head decodes with [`crate::Hotwords`]: CTC only, for now.
+  pub fn takes_hotwords(&self) -> bool {
+    matches!(self.head, Head::Ctc { .. })
+  }
+
+  pub fn transcribe(&self, pcm: &[f32], hotwords: Option<&crate::Hotwords>) -> Result<Transcript> {
     let mel = self.frontend.compute(pcm);
     if mel.is_empty() {
       return Ok(Transcript::default());
@@ -151,7 +159,15 @@ impl Gigaam {
     };
     let ids = match &self.head {
       Head::Rnnt(decoder) => decoder.decode(&enc),
-      Head::Ctc { blank } => decoder::ctc(&enc, self.tok.len(), *blank),
+      Head::Ctc { blank } => {
+        let trie = hotwords.map(|h| (h, crate::hotwords::Trie::new(&h.words)));
+        match trie.filter(|(_, t)| !t.is_empty()) {
+          Some((h, trie)) => {
+            crate::hotwords::ctc(&enc, self.tok.len(), *blank, &self.texts, &trie, h.boost, h.beam)
+          }
+          None => decoder::ctc(&enc, self.tok.len(), *blank),
+        }
+      }
     };
     let (ids, frames): (Vec<usize>, Vec<u32>) =
       ids.into_iter().map(|(id, frame)| (id as usize, frame)).unzip();

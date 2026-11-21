@@ -241,6 +241,7 @@ mod fft;
 mod gguf;
 mod gigaam;
 mod gpu;
+mod hotwords;
 #[cfg(feature = "hub")]
 #[cfg_attr(docsrs, doc(cfg(feature = "hub")))]
 pub mod hub;
@@ -259,6 +260,7 @@ use error::bail;
 pub use error::{Error, Result};
 pub use external::Encoder;
 pub use gpu::{Api, Device, DeviceKind, Kernels};
+pub use hotwords::Hotwords;
 pub use split::split;
 
 /// Every GPU adapter wavo can run a model on, through Vulkan, Metal or DX12, starting with the
@@ -400,6 +402,11 @@ pub struct Options {
   /// 15 s window. GigaAM and Moonshine fail on pieces past 1.5 times their window: see
   /// [`Error::AudioTooLong`]. `transcribe_with` ignores it.
   pub window_ms: Option<u32>,
+  /// Words the decoder favours over what it would write otherwise: see [`Hotwords`]. `None`,
+  /// the default, or no words decodes greedily, as before. Only models whose
+  /// [`takes_hotwords`](Model::takes_hotwords) is true use them (GigaAM's CTC models, decoded
+  /// with a prefix beam search); the others ignore them.
+  pub hotwords: Option<Hotwords>,
 }
 
 /// One token of a [`Transcript`].
@@ -710,7 +717,7 @@ impl Model {
     }
 
     let mut transcript = match &self.family {
-      Family::Gigaam(m) => m.transcribe(pcm)?,
+      Family::Gigaam(m) => m.transcribe(pcm, options.hotwords.as_ref())?,
       Family::Parakeet(m) => m.transcribe(pcm)?,
       Family::Whisper(m) => {
         let (mut t, i) = m.transcribe(pcm, language)?;
@@ -947,6 +954,21 @@ impl Model {
   /// ```
   pub fn takes_language(&self) -> bool {
     self.language_tokens() || self.languages.len() == 1
+  }
+
+  /// Whether [`Options::hotwords`] changes how the model decodes: true for GigaAM's CTC models
+  /// (`gigaam-v3-e2e-ctc`, `gigaam-v3-ctc`, `gigaam-multilingual-large-ctc`), false for the
+  /// others, which ignore them.
+  ///
+  /// # Examples
+  ///
+  /// ```no_run
+  /// let model = wavo::Model::load("gigaam-v3-e2e-ctc-Q8_0.gguf")?;
+  /// assert!(model.takes_hotwords());
+  /// # Ok::<(), wavo::Error>(())
+  /// ```
+  pub fn takes_hotwords(&self) -> bool {
+    matches!(&self.family, Family::Gigaam(m) if m.takes_hotwords())
   }
 
   /// Whether the model has a token per language to be told one with: multilingual Whisper.

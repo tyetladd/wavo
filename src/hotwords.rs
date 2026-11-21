@@ -1,0 +1,516 @@
+// Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
+//! Contextual biasing for CTC: a beam search over the likeliest alignments whose hypotheses get a
+//! bonus for each character that follows one of the [`Hotwords`] from the start of a word, taken
+//! back when the word turns off it before a word's end or stem. The words are matched on the text
+//! of the pieces, lowercased, so a word gets its bonus however the vocabulary cuts it.
+
+/// Words and phrases the decoder favours, for [`Options::hotwords`](crate::Options::hotwords):
+/// names, terms and acronyms a model mishears as more common words. Start from
+/// [`Hotwords::new`] and change the fields.
+///
+/// A word is matched from the start of a spoken word, case-insensitively, as the model spells
+/// it: write `кубернетес` for a Russian model that writes the word in Cyrillic, `GigaAM` where it
+/// writes Latin. A word counts as heard when the decoded word reaches its end, or, for a word of 4
+/// or more letters ending in a vowel, `ь` or `й`, its stem without that letter; letters after
+/// that (Russian case endings: `докера`, `докером`) keep the bonus. A phrase (`гига ам`) also
+/// matches with its words run together (`гигаам`).
+///
+/// # Examples
+///
+/// ```
+/// let mut hotwords = wavo::Hotwords::new(["кубернетес", "GigaAM"]);
+/// hotwords.boost = 1.5;
+/// let mut options = wavo::Options::default();
+/// options.hotwords = Some(hotwords);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Hotwords {
+  /// The words and phrases; empty ones are skipped.
+  pub words: Vec<String>,
+  /// The bonus per matching character, in natural-log probability: 0 matches nothing, and from
+  /// about 2 the decoder writes them over common words that sound alike (`доке` as `докере`).
+  /// Default 1.5.
+  pub boost: f32,
+  /// Hypotheses kept per frame, at least 1. Default 8.
+  pub beam: usize,
+}
+
+impl Hotwords {
+  /// `words` with the default [`boost`](Self::boost) and [`beam`](Self::beam).
+  pub fn new<S: Into<String>>(words: impl IntoIterator<Item = S>) -> Self {
+    Self { words: words.into_iter().map(Into::into).collect(), boost: 1.5, beam: 8 }
+  }
+}
+
+/// Characters a word ending in one of them may drop for its stem: `москва` → `москв`.
+const ENDINGS: &str = "аяоеёыиьйуюэ";
+
+/// A word boundary: SentencePiece's `▁`, whitespace or punctuation.
+fn boundary(c: char) -> bool {
+  !(c.is_alphanumeric() || c == '-' || c == '\'')
+}
+
+/// The words' characters as a tree; node 0 is the root.
+pub(crate) struct Trie {
+  /// Per node its children `(character, node)` and whether a word ends there.
+  nodes: Vec<(Vec<(char, u32)>, bool)>,
+}
+
+impl Trie {
+  pub fn new(words: &[String]) -> Self {
+    let mut trie = Self { nodes: vec![(Vec::new(), false)] };
+    for word in words {
+      let spaced: Vec<String> =
+        word.split(boundary).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+      if spaced.is_empty() {
+        continue;
+      }
+      trie.insert(&spaced.join(" "));
+      if spaced.len() > 1 {
+        trie.insert(&spaced.concat());
+      }
+    }
+    trie
+  }
+
+  fn insert(&mut self, word: &str) {
+    let chars: Vec<char> = word.chars().collect();
+    let mut node = 0;
+    for (i, &c) in chars.iter().enumerate() {
+      node = match self.child(node, c) {
+        Some(n) => n,
+        None => {
+          self.nodes.push((Vec::new(), false));
+          let n = (self.nodes.len() - 1) as u32;
+          self.nodes[node as usize].0.push((c, n));
+          n
+        }
+      };
+      let stem = i + 2 == chars.len() && chars.len() >= 4 && ENDINGS.contains(chars[i + 1]);
+      if stem || i + 1 == chars.len() {
+        self.nodes[node as usize].1 = true;
+      }
+    }
+  }
+
+  fn child(&self, node: u32, c: char) -> Option<u32> {
+    self.nodes[node as usize].0.iter().find(|e| e.0 == c).map(|e| e.1)
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.nodes[0].0.is_empty()
+  }
+
+  /// `ctx` after the characters of `text`, and the change to the hypothesis' bonus.
+  fn advance(&self, mut ctx: Ctx, text: &[char], boost: f32) -> (Ctx, f32) {
+    let mut delta = 0.0;
+    for &c in text {
+      if boundary(c) {
+        let phrase = c == '▁' || c.is_whitespace();
+        match ctx.node.filter(|&n| n != 0 && phrase).and_then(|n| self.child(n, ' ')) {
+          Some(n) => ctx.node = Some(n),
+          None => {
+            delta -= ctx.open();
+            ctx = Ctx::START;
+          }
+        }
+        continue;
+      }
+      let lower = c.to_lowercase().next().unwrap_or(c);
+      match ctx.node.and_then(|n| self.child(n, lower)) {
+        Some(n) => {
+          delta += boost;
+          ctx.word += boost;
+          if self.nodes[n as usize].1 {
+            ctx.kept = Some(ctx.word);
+          }
+          ctx.node = Some(n);
+        }
+        // A case ending after a word's end or stem.
+        None if ctx.kept.is_some() && ctx.tail < TAIL && ('а'..='я').contains(&lower) => {
+          ctx.tail += 1;
+          ctx.node = None;
+        }
+        None => {
+          delta -= ctx.word;
+          ctx = Ctx::OFF;
+        }
+      }
+    }
+    (ctx, delta)
+  }
+}
+
+/// Letters a word may go on for past a word's end or stem and keep the bonus: `докер` +
+/// `ами`.
+const TAIL: u8 = 3;
+
+/// Where a hypothesis is in the tree: `node` while its current word follows a word from the
+/// start (`Some(0)` at a word's start), `None` in a case ending or off the tree until the next
+/// boundary; `word` the bonus the word got, `kept` how much of it a word end or stem has
+/// earned, and `tail` the letters after the last of them.
+#[derive(Clone, Copy, Debug)]
+struct Ctx {
+  node: Option<u32>,
+  word: f32,
+  kept: Option<f32>,
+  tail: u8,
+}
+
+impl Ctx {
+  const START: Ctx = Ctx { node: Some(0), word: 0.0, kept: None, tail: 0 };
+  const OFF: Ctx = Ctx { node: None, ..Ctx::START };
+
+  /// The bonus taken back if the word ended here.
+  fn open(&self) -> f32 {
+    self.word - self.kept.unwrap_or(0.0)
+  }
+}
+
+/// One prefix: its last token and its parent.
+struct Prefix {
+  parent: u32,
+  token: u32,
+  ctx: Ctx,
+  bonus: f32,
+}
+
+#[derive(Clone, Copy)]
+struct Hyp {
+  prefix: u32,
+  /// Log probabilities of the prefix ending in a blank and in its last token.
+  blank: f32,
+  token: f32,
+}
+
+/// How far below a frame's best logit a token is still tried, at least: past it a token needs a
+/// bonus no piece gets.
+const PRUNE: f32 = 10.0;
+
+/// Two paths into one prefix keep the likelier: the beam then follows the likeliest alignment,
+/// so without a bonus it ends on greedy decoding's (summing them, as prefix beam search does,
+/// can rank another cut of the same sounds higher, `SS H` over greedy's `SSH`).
+fn add(a: f32, b: f32) -> f32 {
+  a.max(b)
+}
+
+/// CTC beam search over `logits` `[frames][classes]` with the bonus of `trie`: `texts[id]`
+/// is each token's text as decoded (`▁` for a space). Returns `(token, frame)` pairs as greedy
+/// CTC does, a token's frame being the first of its run on the likeliest alignment.
+pub(crate) fn ctc(
+  logits: &[f32],
+  classes: usize,
+  blank: usize,
+  texts: &[Vec<char>],
+  trie: &Trie,
+  boost: f32,
+  beam: usize,
+) -> Vec<(u32, u32)> {
+  const ROOT: u32 = u32::MAX;
+  let beam = beam.max(1);
+  let mut prefixes = vec![Prefix { parent: ROOT, token: ROOT, ctx: Ctx::START, bonus: 0.0 }];
+  let mut children: std::collections::HashMap<(u32, u32), u32> = Default::default();
+  let mut beams = vec![Hyp { prefix: 0, blank: 0.0, token: f32::NEG_INFINITY }];
+  let mut order: Vec<usize> = Vec::with_capacity(classes);
+  let longest = texts.iter().map(Vec::len).max().unwrap_or(0);
+  let prune = PRUNE.max(boost * longest as f32);
+  let mut next: Vec<Hyp> = Vec::new();
+
+  for logits in logits.chunks_exact(classes) {
+    // Raw logits: every alignment takes one entry of each row, so a row's log-softmax would
+    // shift them all alike.
+    let row = logits;
+    // A prefix grows only by the frame's `beam` likeliest tokens within `prune` of its best:
+    // a model's rows are peaked, so mostly one or two.
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    order.clear();
+    order.extend((0..classes).filter(|&c| row[c] > max - prune));
+    let top = beam.min(order.len());
+    if top < order.len() {
+      order.select_nth_unstable_by(top - 1, |&a, &b| row[b].total_cmp(&row[a]));
+    }
+
+    next.clear();
+    let slot = |prefix: u32, next: &mut Vec<Hyp>| match next.iter().position(|h| h.prefix == prefix)
+    {
+      Some(i) => i,
+      None => {
+        next.push(Hyp { prefix, blank: f32::NEG_INFINITY, token: f32::NEG_INFINITY });
+        next.len() - 1
+      }
+    };
+    for h in &beams {
+      let total = add(h.blank, h.token);
+      let last = prefixes[h.prefix as usize].token;
+      let i = slot(h.prefix, &mut next);
+      next[i].blank = add(next[i].blank, total + row[blank]);
+      if last != ROOT {
+        next[i].token = add(next[i].token, h.token + row[last as usize]);
+      }
+      for &c in &order[..top] {
+        if c == blank {
+          continue;
+        }
+        let (pctx, pbonus) = (prefixes[h.prefix as usize].ctx, prefixes[h.prefix as usize].bonus);
+        let child = *children.entry((h.prefix, c as u32)).or_insert_with(|| {
+          let (ctx, delta) = trie.advance(pctx, &texts[c], boost);
+          let bonus = pbonus + delta;
+          prefixes.push(Prefix { parent: h.prefix, token: c as u32, ctx, bonus });
+          (prefixes.len() - 1) as u32
+        });
+        // A repeat of the last token extends the prefix only across a blank.
+        let from = if c as u32 == last { h.blank } else { total };
+        let i = slot(child, &mut next);
+        next[i].token = add(next[i].token, from + row[c]);
+      }
+    }
+    let score = |h: &Hyp| add(h.blank, h.token) + prefixes[h.prefix as usize].bonus;
+    next.sort_by(|a, b| score(b).total_cmp(&score(a)).then(a.prefix.cmp(&b.prefix)));
+    next.truncate(beam);
+    std::mem::swap(&mut beams, &mut next);
+  }
+
+  // The last word's bonus counts only if it ended a word.
+  let fin = |h: &Hyp| {
+    let p = &prefixes[h.prefix as usize];
+    add(h.blank, h.token) + p.bonus - p.ctx.open()
+  };
+  let best = beams.iter().max_by(|a, b| fin(a).total_cmp(&fin(b)).then(b.prefix.cmp(&a.prefix)));
+  let mut tokens = Vec::new();
+  let mut p = best.map_or(0, |h| h.prefix);
+  while p != 0 {
+    tokens.push(prefixes[p as usize].token);
+    p = prefixes[p as usize].parent;
+  }
+  tokens.reverse();
+  let frames = align(logits, classes, blank, &tokens);
+  tokens.into_iter().zip(frames).collect()
+}
+
+/// The first frame of each token's run on the likeliest CTC alignment of `tokens` to `logits`
+/// (Viterbi over blank, token, blank, …; a row's log-softmax only shifts every path alike).
+fn align(logits: &[f32], classes: usize, blank: usize, tokens: &[u32]) -> Vec<u32> {
+  let (frames, states) = (logits.len() / classes, 2 * tokens.len() + 1);
+  if tokens.is_empty() {
+    return Vec::new();
+  }
+  let label = |s: usize| if s.is_multiple_of(2) { blank } else { tokens[s / 2] as usize };
+  // How far back each state came from: 0, 1 or 2 states.
+  let mut back = vec![0u8; frames * states];
+  let mut score = vec![f32::NEG_INFINITY; states];
+  score[0] = logits[blank];
+  score[1] = logits[label(1)];
+  let mut prev = score.clone();
+  for t in 1..frames {
+    std::mem::swap(&mut prev, &mut score);
+    let row = &logits[t * classes..][..classes];
+    for s in 0..states {
+      let mut best = (prev[s], 0u8);
+      if s >= 1 && prev[s - 1] > best.0 {
+        best = (prev[s - 1], 1);
+      }
+      if s >= 2 && s % 2 == 1 && label(s) != label(s - 2) && prev[s - 2] > best.0 {
+        best = (prev[s - 2], 2);
+      }
+      score[s] = best.0 + row[label(s)];
+      back[t * states + s] = best.1;
+    }
+  }
+  let mut s =
+    if states > 1 && score[states - 2] > score[states - 1] { states - 2 } else { states - 1 };
+  let mut out = vec![0u32; tokens.len()];
+  for t in (0..frames).rev() {
+    if s % 2 == 1 {
+      out[s / 2] = t as u32;
+    }
+    if t > 0 {
+      s -= back[t * states + s] as usize;
+    }
+  }
+  out
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A small BPE vocabulary: id 0 is the blank.
+  const VOCAB: &[&str] = &[
+    "<blk>",
+    "▁при",
+    "вет",
+    "▁мир",
+    "▁док",
+    "ер",
+    "ор",
+    "тор",
+    "а",
+    "ом",
+    "▁куб",
+    "ерн",
+    "етес",
+    "итис",
+    "▁гига",
+    "▁ам",
+    "ам",
+  ];
+
+  fn texts() -> Vec<Vec<char>> {
+    VOCAB.iter().map(|p| p.chars().collect()).collect()
+  }
+
+  fn id(piece: &str) -> usize {
+    VOCAB.iter().position(|p| *p == piece).unwrap()
+  }
+
+  /// One row per frame: the given pieces at their log probabilities, the rest far below.
+  fn logits(frames: &[&[(&str, f32)]]) -> Vec<f32> {
+    let mut out = vec![-20.0f32; frames.len() * VOCAB.len()];
+    for (t, row) in frames.iter().enumerate() {
+      for &(piece, lp) in *row {
+        out[t * VOCAB.len() + id(piece)] = lp;
+      }
+    }
+    out
+  }
+
+  fn decode(logits: &[f32], words: &[&str], boost: f32) -> String {
+    let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    let ids = ctc(logits, VOCAB.len(), 0, &texts(), &Trie::new(&words), boost, 8);
+    ids
+      .iter()
+      .map(|&(id, _)| VOCAB[id as usize])
+      .collect::<String>()
+      .replace('▁', " ")
+      .trim()
+      .to_string()
+  }
+
+  fn greedy(logits: &[f32]) -> String {
+    let ids = crate::gigaam::decoder::ctc(logits, VOCAB.len(), 0);
+    ids
+      .iter()
+      .map(|&(id, _)| VOCAB[id as usize])
+      .collect::<String>()
+      .replace('▁', " ")
+      .trim()
+      .to_string()
+  }
+
+  #[test]
+  fn a_near_miss_becomes_the_hotword() {
+    // "докор" is a little likelier than "докер".
+    let l = logits(&[&[("▁док", -0.1)], &[("<blk>", -0.1)], &[("ор", -0.5), ("ер", -1.0)]]);
+    assert_eq!(decode(&l, &[], 1.0), "докор");
+    assert_eq!(decode(&l, &["докер"], 0.0), "докор");
+    assert_eq!(decode(&l, &["Докер"], 1.0), "докер");
+
+    let l = logits(&[&[("▁куб", -0.1)], &[("ерн", -0.1)], &[("итис", -0.3), ("етес", -1.2)]]);
+    assert_eq!(decode(&l, &[], 1.0), "кубернитис");
+    assert_eq!(decode(&l, &["кубернетес"], 1.0), "кубернетес");
+  }
+
+  #[test]
+  fn an_inflected_word_keeps_the_bonus() {
+    let l = logits(&[&[("▁док", -0.1)], &[("ор", -0.5), ("ер", -1.0)], &[("ом", -0.1)]]);
+    assert_eq!(decode(&l, &["докер"], 1.0), "докером");
+  }
+
+  #[test]
+  fn a_word_that_turns_off_gets_no_bonus() {
+    // "доктор" shares "док" with the hotword; the bonus for "док" is taken back.
+    let l = logits(&[&[("▁док", -0.1)], &[("тор", -0.2), ("ер", -8.0)]]);
+    assert_eq!(decode(&l, &["докер"], 1.0), "доктор");
+    // And the beam doesn't stop on a hotword's prefix: "док" alone isn't a word end.
+    let l = logits(&[&[("▁док", -0.1)], &[("<blk>", -0.1)]]);
+    assert_eq!(decode(&l, &["докер"], 1.0), "док");
+  }
+
+  #[test]
+  fn a_phrase_matches_spaced_and_run_together() {
+    let l = logits(&[&[("▁гига", -0.1)], &[("ам", -0.9), ("▁ам", -1.2), ("<blk>", -0.6)]]);
+    assert_eq!(decode(&l, &[], 1.0), "гига");
+    assert_eq!(decode(&l, &["гига ам"], 1.0), "гигаам");
+  }
+
+  #[test]
+  fn without_a_match_the_beam_is_greedy() {
+    // Peaked rows, as a model's mostly are: repeats collapse, blanks split them.
+    let l = logits(&[
+      &[("▁при", -0.1), ("▁мир", -2.0)],
+      &[("▁при", -0.2), ("<blk>", -1.0)],
+      &[("<blk>", -0.1)],
+      &[("вет", -0.1), ("ер", -3.0)],
+      &[("<blk>", -0.3), ("вет", -1.5)],
+      &[("▁мир", -0.1)],
+      &[("▁мир", -0.4), ("<blk>", -1.2)],
+      &[("<blk>", -0.1)],
+      &[("▁мир", -0.1)],
+    ]);
+    assert_eq!(greedy(&l), "привет мир мир");
+    assert_eq!(decode(&l, &[], 1.0), greedy(&l));
+    assert_eq!(decode(&l, &["кубернетес"], 1.0), greedy(&l));
+  }
+
+  #[test]
+  fn frames_are_where_tokens_start() {
+    let l = logits(&[&[("<blk>", -0.1)], &[("▁док", -0.1)], &[("▁док", -0.1)], &[("ер", -0.1)]]);
+    let words = vec!["докер".to_string()];
+    let ids = ctc(&l, VOCAB.len(), 0, &texts(), &Trie::new(&words), 1.0, 8);
+    assert_eq!(ids, [(id("▁док") as u32, 1), (id("ер") as u32, 3)]);
+  }
+
+  #[test]
+  fn a_character_vocabulary_matches_too() {
+    // GigaAM `ctc`: one letter per token, a space token between words.
+    let vocab = ["<blk>", " ", "д", "о", "к", "е", "р", "а"];
+    let texts: Vec<Vec<char>> = vocab.iter().map(|p| p.chars().collect()).collect();
+    let mut l = vec![-20.0f32; 6 * vocab.len()];
+    for (t, row) in [
+      &[(2, -0.1)][..],
+      &[(3, -0.1)],
+      &[(4, -0.1)],
+      &[(3, -0.4), (5, -0.9)],
+      &[(6, -0.1)],
+      &[(1, -0.1)],
+    ]
+    .iter()
+    .enumerate()
+    {
+      row.iter().for_each(|&(id, lp)| l[t * vocab.len() + id] = lp);
+    }
+    let spell =
+      |ids: Vec<(u32, u32)>| ids.iter().map(|&(id, _)| vocab[id as usize]).collect::<String>();
+    let none = Trie::new(&[]);
+    assert_eq!(spell(ctc(&l, vocab.len(), 0, &texts, &none, 1.5, 8)), "докор ");
+    let trie = Trie::new(&["докер".to_string()]);
+    assert_eq!(spell(ctc(&l, vocab.len(), 0, &texts, &trie, 1.5, 8)), "докер ");
+  }
+
+  #[test]
+  fn stems_endings_and_empty_words() {
+    let trie = Trie::new(&["".to_string(), " , ".to_string()]);
+    assert!(trie.is_empty());
+    let trie = Trie::new(&["Москва".to_string()]);
+    let word = |w: &str| {
+      let chars: Vec<char> = w.chars().collect();
+      let (ctx, delta) = trie.advance(Ctx::START, &chars, 1.0);
+      delta - ctx.open()
+    };
+    assert_eq!(word("москв"), 5.0);
+    assert_eq!(word("москвы"), 5.0);
+    assert_eq!(word("моск"), 0.0);
+    assert_eq!(word("МОСКВА"), 6.0);
+    let trie = Trie::new(&["докер".to_string()]);
+    let word = |w: &str| {
+      let chars: Vec<char> = w.chars().collect();
+      let (ctx, delta) = trie.advance(Ctx::START, &chars, 1.0);
+      delta - ctx.open()
+    };
+    assert_eq!(word("докерами"), 5.0);
+    assert_eq!(word("докерамиии"), 0.0);
+    assert_eq!(word("докерbraz"), 0.0);
+    assert_eq!(word("доктор"), 0.0);
+  }
+}
