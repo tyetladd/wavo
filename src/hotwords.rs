@@ -593,4 +593,44 @@ mod tests {
     assert_eq!(word("докерbraz"), 0.0);
     assert_eq!(word("доктор"), 0.0);
   }
+
+  /// `cargo test --release --lib hotwords::tests::speed -- --ignored --nocapture`, also on a phone:
+  /// 25 s of GigaAM-sized random logits (no row peaked, the worst case) with and without the
+  /// words, the fastest of 5.
+  #[test]
+  #[ignore]
+  fn speed() {
+    let (frames, classes) = (625, 1025);
+    let mut seed = 1u64;
+    let logits: Vec<f32> = (0..frames * classes)
+      .map(|_| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 40) as f32 / (1u64 << 24) as f32 * 8.0
+      })
+      .collect();
+    let texts: Vec<Vec<char>> =
+      (0..classes).map(|i| format!("▁д{}", i % 7).chars().collect()).collect();
+    let words: Vec<String> = ["кубернетес", "докер", "эс эс эйч", "GigaAM", "паракит"]
+      .iter()
+      .map(|w| w.to_string())
+      .collect();
+    let trie = Trie::new(&words);
+    let best = |f: &dyn Fn()| {
+      (0..5)
+        .map(|_| {
+          let t = std::time::Instant::now();
+          f();
+          t.elapsed().as_secs_f64() * 1000.0
+        })
+        .fold(f64::MAX, f64::min)
+    };
+    let greedy =
+      best(&|| drop(std::hint::black_box(crate::gigaam::decoder::ctc(&logits, classes, 0))));
+    let beam =
+      best(&|| drop(std::hint::black_box(ctc(&logits, classes, 0, &texts, &trie, 1.5, 8))));
+    eprintln!(
+      "25 s of logits: greedy {greedy:.2} ms, hotwords {beam:.2} ms, +{:.3} ms per second",
+      (beam - greedy) / 25.0
+    );
+  }
 }
