@@ -468,6 +468,35 @@ pub fn matvecs<const N: usize>(jobs: [(&Matrix, &[f32]); N]) -> [Vec<f32>; N] {
   out
 }
 
+/// `w · x` for each of `xs`: as [`matvecs`], but a block of 64 rows is read once for all of them,
+/// so a beam's hypotheses share one pass over the weights.
+pub fn matvec_each(w: &Matrix, xs: &[&[f32]]) -> Vec<Vec<f32>> {
+  let rows = w.len();
+  let mut out = vec![0.0; xs.len() * rows];
+  let blocks = (0..rows.div_ceil(64)).map(|i| 64 * i);
+  let blocks = Mutex::new(blocks);
+  let next = || blocks.lock().unwrap_or_else(PoisonError::into_inner).next();
+  let cells: Vec<Mutex<&mut [f32]>> = out.chunks_mut(rows).map(Mutex::new).collect();
+  let work = || {
+    let mut acc = vec![0.0; 64];
+    while let Some(r0) = next() {
+      let n = 64.min(rows - r0);
+      for (x, cell) in xs.iter().zip(&cells) {
+        w.rows(r0, x, &mut acc[..n]);
+        cell.lock().unwrap_or_else(PoisonError::into_inner)[r0..r0 + n].copy_from_slice(&acc[..n]);
+      }
+    }
+  };
+  std::thread::scope(|s| {
+    for _ in 1..4 {
+      s.spawn(work);
+    }
+    work();
+  });
+  drop(cells);
+  out.chunks_exact(rows).map(<[f32]>::to_vec).collect()
+}
+
 #[cfg(test)]
 mod tests {
   use half::f16;

@@ -37,6 +37,8 @@ pub struct Parakeet {
   kestrel: bool,
   /// The joint's hidden size: an outside encoder's rows are this wide.
   joint: usize,
+  /// Each token's text, for [`crate::hotwords`]; none for the special ones.
+  texts: Vec<Vec<char>>,
 }
 
 /// Encoder frames of `mel_frames` mel frames: three stride-2 convs over all but the last mel frame,
@@ -107,7 +109,7 @@ impl Parakeet {
       bail!("vocabulary of {} tokens, {} token types, blank {blank}", vocab.len(), types.len());
     }
     // SentencePiece token types 2 and 3: unknown and control.
-    let special = (0..vocab.len())
+    let special: Vec<bool> = (0..vocab.len())
       .map(|i| matches!(types[i], 2 | 3) || i == unk || vocab[i] == "<unk>")
       .collect();
 
@@ -120,14 +122,18 @@ impl Parakeet {
       Ok::<_, Error>((backend, decoder.join().unwrap()?))
     })?;
     let tok = Tokenizer::new(&vocab);
-    Ok(Self { backend, frontend: Frontend::new(), decoder, tok, special, kestrel, joint })
+    let texts = (0..vocab.len())
+      .map(|id| if special[id] { Vec::new() } else { tok.pieces(&[id])[0].chars().collect() })
+      .collect();
+    Ok(Self { backend, frontend: Frontend::new(), decoder, tok, special, kestrel, joint, texts })
   }
 
   pub fn device(&self) -> &crate::Device {
     self.backend.device()
   }
 
-  pub fn transcribe(&self, pcm: &[f32]) -> Result<Transcript> {
+  /// The words of `hotwords` are favoured while decoding ([`crate::hotwords::transducer`]).
+  pub fn transcribe(&self, pcm: &[f32], hotwords: Option<&crate::Hotwords>) -> Result<Transcript> {
     let mel = self.frontend.compute(pcm);
     if mel.is_empty() {
       return Ok(Transcript::default());
@@ -148,7 +154,12 @@ impl Parakeet {
         (enc, self.joint)
       }
     };
-    let (ids, frames): (Vec<usize>, Vec<u32>) = (self.decoder.decode(&enc, width).into_iter())
+    let trie = hotwords.map(|h| (h, crate::hotwords::Trie::new(&h.words)));
+    let ids = match trie.filter(|(_, t)| !t.is_empty()) {
+      Some((h, trie)) => self.decoder.beam(&enc, width, &self.texts, &trie, h.boost, h.beam),
+      None => self.decoder.decode(&enc, width),
+    };
+    let (ids, frames): (Vec<usize>, Vec<u32>) = (ids.into_iter())
       .filter(|&(id, _)| !self.special[id as usize])
       .map(|(id, frame)| (id as usize, frame))
       .unzip();

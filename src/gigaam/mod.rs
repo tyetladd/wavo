@@ -139,9 +139,9 @@ impl Gigaam {
     self.backend.device()
   }
 
-  /// Whether the head decodes with [`crate::Hotwords`]: CTC only, for now.
+  /// Whether the head decodes with [`crate::Hotwords`]: both do.
   pub fn takes_hotwords(&self) -> bool {
-    matches!(self.head, Head::Ctc { .. })
+    true
   }
 
   pub fn transcribe(&self, pcm: &[f32], hotwords: Option<&crate::Hotwords>) -> Result<Transcript> {
@@ -157,16 +157,16 @@ impl Gigaam {
         encoder.encode(&mel, self.frontend.mels()).map_err(crate::Error::Encoder)?
       }
     };
-    let ids = match &self.head {
-      Head::Rnnt(decoder) => decoder.decode(&enc),
-      Head::Ctc { blank } => {
-        let trie = hotwords.map(|h| (h, crate::hotwords::Trie::new(&h.words)));
-        match trie.filter(|(_, t)| !t.is_empty()) {
-          Some((h, trie)) => {
-            crate::hotwords::ctc(&enc, self.tok.len(), *blank, &self.texts, &trie, h.boost, h.beam)
-          }
-          None => decoder::ctc(&enc, self.tok.len(), *blank),
-        }
+    let trie = hotwords.map(|h| (h, crate::hotwords::Trie::new(&h.words)));
+    let trie = trie.filter(|(_, t)| !t.is_empty());
+    let ids = match (&self.head, trie) {
+      (Head::Rnnt(decoder), None) => decoder.decode(&enc),
+      (Head::Rnnt(decoder), Some((h, trie))) => {
+        decoder.beam(&enc, &self.texts, &trie, h.boost, h.beam)
+      }
+      (Head::Ctc { blank }, None) => decoder::ctc(&enc, self.tok.len(), *blank),
+      (Head::Ctc { blank }, Some((h, trie))) => {
+        crate::hotwords::ctc(&enc, self.tok.len(), *blank, &self.texts, &trie, h.boost, h.beam)
       }
     };
     let (ids, frames): (Vec<usize>, Vec<u32>) =

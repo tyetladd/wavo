@@ -1,8 +1,9 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! Contextual biasing for CTC: a beam search over the likeliest alignments whose hypotheses get a
-//! bonus for each character that follows one of the [`Hotwords`] from the start of a word, taken
-//! back when the word turns off it before a word's end or stem. The words are matched on the text
-//! of the pieces, lowercased, so a word gets its bonus however the vocabulary cuts it.
+//! Contextual biasing: a beam search (CTC's over the likeliest alignments, a transducer's over its
+//! decisions) whose hypotheses get a bonus for each character that follows one of the
+//! [`Hotwords`] from the start of a word, taken back when the word turns off it before a word's
+//! end or stem. The words are matched on the text of the pieces, lowercased, so a word gets its
+//! bonus however the vocabulary cuts it.
 
 /// Words and phrases the decoder favours, for [`Options::hotwords`](crate::Options::hotwords):
 /// names, terms and acronyms a model mishears as more common words. Start from
@@ -229,6 +230,11 @@ const GRACE: u32 = 3;
 /// bonus no piece gets.
 const PRUNE: f32 = 10.0;
 
+/// A transducer's token other than greedy decoding's is taken for a word only within this much,
+/// in log probability, of the decision after its own bonus: at 2 the reading page lost 8 of 64
+/// terms found at 4, at 6 it found 6 more in twice the time.
+const REACH: f32 = 4.0;
+
 /// Two paths into one prefix keep the likelier: the beam then follows the likeliest alignment,
 /// so without a bonus it ends on greedy decoding's (summing them, as prefix beam search does,
 /// can rank another cut of the same sounds higher, `SS H` over greedy's `SSH`).
@@ -335,17 +341,323 @@ pub(crate) fn ctc(
     p = prefixes[p as usize].parent;
   }
   tokens.reverse();
-  // A lone `▁` before a word that starts with its own is an empty word: the model writes one
-  // before Latin letters, and the bonus may have spelled the word in Cyrillic.
-  let space = |id: u32| texts[id as usize] == ['▁'];
-  let starts = |id: u32| texts[id as usize].first() == Some(&'▁');
-  let kept: Vec<u32> = (0..tokens.len())
-    .filter(|&i| !(space(tokens[i]) && tokens.get(i + 1).is_some_and(|&n| starts(n))))
-    .map(|i| tokens[i])
-    .collect();
-  let tokens = kept;
+  let tokens: Vec<u32> = lone_spaces(&tokens, texts).map(|i| tokens[i]).collect();
   let frames = align(logits, classes, blank, &tokens);
   tokens.into_iter().zip(frames).collect()
+}
+
+/// The indices of `tokens` but a lone `▁` before a word that starts with its own: an empty word.
+/// The model writes one before Latin letters, and the bonus may have spelled the word in Cyrillic.
+fn lone_spaces<'a>(tokens: &'a [u32], texts: &'a [Vec<char>]) -> impl Iterator<Item = usize> + 'a {
+  let space = |id: u32| texts[id as usize] == ['▁'];
+  let starts = |id: u32| texts[id as usize].first() == Some(&'▁');
+  (0..tokens.len())
+    .filter(move |&i| !(space(tokens[i]) && tokens.get(i + 1).is_some_and(|&n| starts(n))))
+}
+
+/// A transducer's predictor and joint, for [`transducer`]: GigaAM's RNN-T, Parakeet's TDT.
+pub(crate) trait Transducer {
+  /// The predictor's state after some tokens.
+  type State;
+  /// The state before any token, and the joint's projection of it.
+  fn start(&self) -> (Self::State, Vec<f32>);
+  /// The state after `token`, and the joint's projection of it.
+  fn step(&self, state: &Self::State, token: usize) -> (Self::State, Vec<f32>);
+  /// [`Transducer::step`] for each of `steps`, in one go where the model can.
+  fn steps(&self, steps: &[(&Self::State, usize)]) -> Vec<(Self::State, Vec<f32>)> {
+    steps.iter().map(|&(state, token)| self.step(state, token)).collect()
+  }
+  /// For frame `t` and each of `preds`: the log probabilities of the tokens (blank included) and
+  /// of the durations (none for RNN-T).
+  fn joint(&self, t: usize, preds: &[&[f32]]) -> Vec<(Vec<f32>, Vec<f32>)>;
+}
+
+/// How a transducer moves on: with no `durations` (RNN-T) a token stays on its frame and a blank
+/// moves one on; with them (TDT) a decision moves on by its likeliest duration, a blank by at
+/// least one. At most `max_symbols` tokens are emitted on one frame, as greedy decoding does.
+pub(crate) struct Steps<'a> {
+  pub blank: usize,
+  pub durations: &'a [usize],
+  pub max_symbols: usize,
+}
+
+/// A prefix's predictor: its state and projection, or its parent's and the token to step on,
+/// computed when the prefix is first scored.
+enum Pred<S> {
+  Ready(std::rc::Rc<(S, Vec<f32>)>),
+  After(std::rc::Rc<(S, Vec<f32>)>, usize),
+}
+
+impl<S> Clone for Pred<S> {
+  fn clone(&self) -> Self {
+    match self {
+      Pred::Ready(r) => Pred::Ready(r.clone()),
+      Pred::After(r, token) => Pred::After(r.clone(), *token),
+    }
+  }
+}
+
+/// The predictor of every path, stepped in one go.
+fn ready<T: Transducer>(model: &T, paths: &mut [Path<T::State>]) {
+  let after: Vec<(&T::State, usize)> = (paths.iter())
+    .filter_map(|p| match &p.pred {
+      Pred::After(parent, token) => Some((&parent.0, *token)),
+      Pred::Ready(_) => None,
+    })
+    .collect();
+  if after.is_empty() {
+    return;
+  }
+  let mut stepped = model.steps(&after).into_iter();
+  for p in paths.iter_mut() {
+    if matches!(p.pred, Pred::After(..)) {
+      p.pred = Pred::Ready(std::rc::Rc::new(stepped.next().unwrap()));
+    }
+  }
+}
+
+/// A transducer hypothesis: a prefix on a frame, its log probability, the frame of its last
+/// token, the tokens emitted on this frame so far, and whether it is a guess.
+struct Path<S> {
+  prefix: u32,
+  score: f32,
+  since: u32,
+  symbols: usize,
+  pred: Pred<S>,
+  /// It left greedy decoding's decisions for a word it hasn't finished.
+  guess: bool,
+  /// The frames of its tokens, the last first.
+  frames: Option<std::rc::Rc<Frames>>,
+}
+
+/// A path's token frames as a list shared by the paths that branch from it.
+struct Frames {
+  frame: u32,
+  before: Option<std::rc::Rc<Frames>>,
+}
+
+/// One prefix of a transducer search: its last token and the tree's state after it. The frames
+/// are each path's: two paths into one prefix may have emitted its tokens on other frames.
+struct Node {
+  parent: u32,
+  token: u32,
+  ctx: Ctx,
+  bonus: f32,
+}
+
+/// The hypotheses of one frame, as [`ctc`] keeps them: one per prefix (the likelier; the
+/// predictor's state follows from the prefix alone), the `beam / 2` best as if decoding stopped
+/// here and the `beam` best with the bonus of the words being spelled, and the best that is no
+/// guess. The first is the best without unfinished words.
+fn keep<S>(mut paths: Vec<Path<S>>, nodes: &[Node], t: usize, beam: usize) -> Vec<Path<S>> {
+  // Paths into one prefix merge into the likelier; it is a guess only if both are.
+  paths.sort_by(|a, b| a.prefix.cmp(&b.prefix).then(b.score.total_cmp(&a.score)));
+  paths.dedup_by(|b, a| {
+    let same = a.prefix == b.prefix;
+    if same {
+      a.guess &= b.guess;
+    }
+    same
+  });
+  let settled = |h: &Path<S>| {
+    let n = &nodes[h.prefix as usize];
+    h.score + n.bonus - n.ctx.open()
+  };
+  let score = |h: &Path<S>| {
+    let n = &nodes[h.prefix as usize];
+    let late = (t as u32).saturating_sub(h.since).saturating_sub(GRACE).min(30) as i32;
+    settled(h) + n.ctx.open() * 0.5f32.powi(late)
+  };
+  paths.sort_by(|a, b| settled(b).total_cmp(&settled(a)).then(a.prefix.cmp(&b.prefix)));
+  let sure = (beam / 2).max(1).min(paths.len());
+  paths[sure..].sort_by(|a, b| score(b).total_cmp(&score(a)).then(a.prefix.cmp(&b.prefix)));
+  // The best path that is no guess stays too: guesses may all end, and without it nothing
+  // would be left to go on with.
+  let sure_path = paths.iter().position(|p| !p.guess).filter(|&i| i >= beam + sure);
+  if let Some(i) = sure_path {
+    paths.swap(beam + sure - 1, i);
+  }
+  paths.truncate(beam + sure);
+  paths
+}
+
+/// Transducer beam search over `frames` with the bonus of `trie`, as [`ctc`]'s: hypotheses are
+/// compared on the same frame only, each frame's kept as [`keep`] does, and a frame's tokens are
+/// tried again until none stays on it. A hypothesis leaves greedy decoding's decision only for a
+/// word of `trie`, within the bonus's reach, so with none in reach it decodes as greedy does (a
+/// transducer's beam over all tokens would rewrite everyday speech: `к 9:00` as `к девяти`).
+/// Returns `(token, frame)` pairs as greedy decoding does.
+pub(crate) fn transducer<T: Transducer>(
+  model: &T,
+  frames: usize,
+  steps: &Steps,
+  texts: &[Vec<char>],
+  trie: &Trie,
+  boost: f32,
+  beam: usize,
+) -> Vec<(u32, u32)> {
+  const ROOT: u32 = u32::MAX;
+  // Each hypothesis costs a predictor step and a joint row: half CTC's beam keeps the cost near
+  // greedy decoding's for as many words found (64 of 98 terms of wavoscribe's reading page with
+  // GigaAM RNN-T at 4, 66 at 8 in twice the time).
+  let beam = (beam / 2).max(1);
+  let blank = steps.blank;
+  let longest = texts.iter().map(Vec::len).max().unwrap_or(0);
+  let prune = PRUNE.max(boost * longest as f32);
+  let mut nodes = vec![Node { parent: ROOT, token: ROOT, ctx: Ctx::START, bonus: 0.0 }];
+  let mut children: std::collections::HashMap<(u32, u32), u32> = Default::default();
+  let mut buckets: Vec<Vec<Path<T::State>>> = (0..=frames).map(|_| Vec::new()).collect();
+  let start = Pred::Ready(std::rc::Rc::new(model.start()));
+  buckets[0].push(Path {
+    prefix: 0,
+    score: 0.0,
+    since: 0,
+    symbols: 0,
+    pred: start,
+    guess: false,
+    frames: None,
+  });
+  let mut order: Vec<usize> = Vec::new();
+
+  for t in 0..frames {
+    let mut paths = keep(std::mem::take(&mut buckets[t]), &nodes, t, beam);
+    while !paths.is_empty() {
+      ready(model, &mut paths);
+      let preds: Vec<&[f32]> = (paths.iter())
+        .map(|p| match &p.pred {
+          Pred::Ready(r) => r.1.as_slice(),
+          Pred::After(..) => unreachable!(),
+        })
+        .collect();
+      let scores = model.joint(t, &preds);
+      let mut stay = Vec::new();
+      for (p, (tokens, durations)) in paths.iter().zip(scores) {
+        let (duration, d) = match durations.is_empty() {
+          true => (None, 0.0),
+          false => {
+            let i = argmax(&durations);
+            (Some(steps.durations[i]), durations[i])
+          }
+        };
+        let to = |on: usize| (t + on).min(frames);
+        // Off a word, a hypothesis makes greedy decoding's decision, or starts a word; spelling
+        // one, it may also wait for its next letter or take the one that goes on with it. So
+        // without a word in reach the search is greedy decoding.
+        let choice = argmax(&tokens);
+        let max = tokens[choice];
+        let spelling = |n: &Node| n.ctx.word > 0.0;
+        let on_word = spelling(&nodes[p.prefix as usize]);
+        // A guess waits for its next letter at most `GRACE` frames: longer, it would skip the
+        // words in between (`и постмания` for `и подключись PS. Модель` with `постман`).
+        let waits = !p.guess || t as u32 <= p.since + GRACE;
+        if choice == blank || (on_word && waits) {
+          let blank_path = Path {
+            prefix: p.prefix,
+            score: p.score + tokens[blank] + d,
+            since: p.since,
+            symbols: 0,
+            pred: p.pred.clone(),
+            guess: p.guess || choice != blank,
+            frames: p.frames.clone(),
+          };
+          buckets[to(duration.unwrap_or(1).max(1))].push(blank_path);
+        }
+
+        order.clear();
+        // A token other than greedy decoding's is taken for a word only if its own bonus pays
+        // for most of what it costs: else a guess would spell a word out on one frame (a
+        // transducer may emit many), whatever was said. Its bonus is at most `boost` a letter.
+        let reach = REACH.min(prune);
+        let worth =
+          |c: usize| c == choice || tokens[c] > max - reach - boost * texts[c].len() as f32;
+        for c in (0..tokens.len()).filter(|&c| c != blank && worth(c)) {
+          let parent = &nodes[p.prefix as usize];
+          let (ctx, bonus) = match children.get(&(p.prefix, c as u32)) {
+            Some(&n) => (nodes[n as usize].ctx, nodes[n as usize].bonus),
+            None => {
+              let (ctx, delta) = trie.advance(parent.ctx, &texts[c], boost);
+              (ctx, parent.bonus + delta)
+            }
+          };
+          let word = ctx.word > 0.0;
+          // A guess whose word turns off before its end was wrong: greedy decoding's path has
+          // that stretch, so it ends here rather than go on as everyday speech.
+          if p.guess && bonus < parent.bonus && !word {
+            continue;
+          }
+          if c == choice || (word && tokens[c] + (bonus - parent.bonus) > max - reach) {
+            children.entry((p.prefix, c as u32)).or_insert_with(|| {
+              nodes.push(Node { parent: p.prefix, token: c as u32, ctx, bonus });
+              (nodes.len() - 1) as u32
+            });
+            order.push(c);
+          }
+        }
+        let top = beam.min(order.len());
+        if top < order.len() {
+          order.select_nth_unstable_by(top - 1, |&a, &b| tokens[b].total_cmp(&tokens[a]));
+        }
+        let Pred::Ready(parent) = &p.pred else { unreachable!() };
+        for &c in &order[..top] {
+          let child = children[&(p.prefix, c as u32)];
+          let mut on = duration.unwrap_or(0);
+          let symbols = if on == 0 { p.symbols + 1 } else { 0 };
+          if on == 0 && symbols >= steps.max_symbols {
+            on = 1;
+          }
+          // A word finished (its bonus kept past the word) is no guess any more.
+          let (before, node) = (&nodes[p.prefix as usize], &nodes[child as usize]);
+          let finished = !spelling(node) && node.bonus >= before.bonus;
+          let path = Path {
+            prefix: child,
+            score: p.score + tokens[c] + d,
+            since: t as u32,
+            symbols: if on == 0 { symbols } else { 0 },
+            pred: Pred::After(parent.clone(), c),
+            guess: (p.guess || c != choice) && !finished,
+            frames: Some(std::rc::Rc::new(Frames { frame: t as u32, before: p.frames.clone() })),
+          };
+          match on {
+            0 => stay.push(path),
+            on => buckets[to(on)].push(path),
+          }
+        }
+      }
+      paths = keep(stay, &nodes, t, beam);
+    }
+  }
+
+  // The last word's bonus counts only if it ended a word: the first kept is the best so.
+  let last = keep(std::mem::take(&mut buckets[frames]), &nodes, frames, beam);
+  let mut out = Vec::new();
+  let (mut p, mut frames) = last.first().map_or((0, None), |h| (h.prefix, h.frames.clone()));
+  while p != 0 {
+    let f = frames.expect("a frame per token");
+    out.push((nodes[p as usize].token, f.frame));
+    (p, frames) = (nodes[p as usize].parent, f.before.clone());
+  }
+  out.reverse();
+  let tokens: Vec<u32> = out.iter().map(|o| o.0).collect();
+  lone_spaces(&tokens, texts).map(|i| out[i]).collect()
+}
+
+/// The index of the first maximum.
+fn argmax(v: &[f32]) -> usize {
+  let mut best = 0;
+  for (i, &x) in v.iter().enumerate() {
+    if x > v[best] {
+      best = i;
+    }
+  }
+  best
+}
+
+/// `logits` as log probabilities.
+pub(crate) fn log_softmax(logits: &mut [f32]) {
+  let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  let sum: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
+  let shift = max + sum.ln();
+  logits.iter_mut().for_each(|x| *x -= shift);
 }
 
 /// The first frame of each token's run on the likeliest CTC alignment of `tokens` to `logits`
@@ -521,6 +833,96 @@ mod tests {
     let ids: Vec<u32> =
       ctc(&l, vocab.len(), 0, &texts, &trie, 1.5, 8).iter().map(|t| t.0).collect();
     assert_eq!(ids, [2, 3, 4]);
+  }
+
+  /// A frame's scripted scores, given the frame and the last token.
+  type Row = fn(usize, Option<usize>) -> Vec<(&'static str, f32)>;
+
+  /// A scripted transducer over [`VOCAB`]: its prediction is the last token, and `script(t, last)`
+  /// gives that frame's scores `(token, score)`, the rest at -20 (blank's id 0 included).
+  struct Script {
+    script: Row,
+    durations: usize,
+  }
+
+  impl Transducer for Script {
+    type State = Option<usize>;
+
+    fn start(&self) -> (Option<usize>, Vec<f32>) {
+      (None, vec![-1.0])
+    }
+
+    fn step(&self, _: &Option<usize>, token: usize) -> (Option<usize>, Vec<f32>) {
+      (Some(token), vec![token as f32])
+    }
+
+    fn joint(&self, t: usize, preds: &[&[f32]]) -> Vec<(Vec<f32>, Vec<f32>)> {
+      (preds.iter())
+        .map(|p| {
+          let last = (p[0] >= 0.0).then_some(p[0] as usize);
+          let mut row = vec![-20.0; VOCAB.len()];
+          for (piece, score) in (self.script)(t, last) {
+            row[VOCAB.iter().position(|v| *v == piece).unwrap()] = score;
+          }
+          log_softmax(&mut row);
+          // TDT: every decision moves on one frame.
+          let mut durations: Vec<f32> =
+            (0..self.durations).map(|d| if d == 1 { 0.0 } else { -9.0 }).collect();
+          log_softmax(&mut durations);
+          (row, durations)
+        })
+        .collect()
+    }
+  }
+
+  fn run(script: &Script, frames: usize, words: &[&str]) -> String {
+    let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    let durations = [0, 1, 2];
+    let steps = Steps { blank: 0, durations: &durations[..script.durations], max_symbols: 10 };
+    let ids = transducer(script, frames, &steps, &texts(), &Trie::new(&words), 1.5, 8);
+    ids
+      .iter()
+      .map(|&(id, _)| VOCAB[id as usize])
+      .collect::<String>()
+      .replace('▁', " ")
+      .trim()
+      .to_string()
+  }
+
+  /// Frame 0 `▁док`, frame 1 `тор` (`ер` 1.5 below it), frame 2 `▁мир` (`▁куб` 3 below it),
+  /// each after the one before; else the blank. RNN-T scores a frame again after its token, and
+  /// gets the blank then; TDT moves on one frame with each decision.
+  fn doctor(t: usize, last: Option<usize>) -> Vec<(&'static str, f32)> {
+    match (t, last.map(|l| VOCAB[l])) {
+      (0, None) => vec![("▁док", 0.0), ("<blk>", -3.0)],
+      (1, Some("▁док")) => vec![("тор", 0.0), ("ер", -1.5), ("<blk>", -3.0)],
+      (2, Some("тор" | "ер")) => vec![("▁мир", 0.0), ("▁куб", -3.0), ("<blk>", -4.0)],
+      _ => vec![("<blk>", 0.0)],
+    }
+  }
+
+  #[test]
+  fn a_transducer_finds_the_word_and_otherwise_decodes_as_greedy() {
+    for durations in [0, 3] {
+      let model = Script { script: doctor, durations };
+      assert_eq!(run(&model, 4, &[]), "доктор мир", "{durations} durations");
+      assert_eq!(run(&model, 4, &["докер"]), "докер мир", "{durations} durations");
+      // A word in reach but not said (`▁куб` of `кубок`), and one out of reach, change nothing.
+      assert_eq!(run(&model, 4, &["кубок", "паровоз"]), "доктор мир", "{durations} durations");
+    }
+  }
+
+  #[test]
+  fn a_transducer_spells_no_word_the_audio_doesnt_have() {
+    // `ер` 7.3 below `тор`: the whole word's 7.5 of bonus would pay for it, but its own 3
+    // leave it 4.3 short, past `REACH`, so `доктор` stays: a word is heard letter by letter.
+    fn far(t: usize, last: Option<usize>) -> Vec<(&'static str, f32)> {
+      match (t, last.map(|l| VOCAB[l])) {
+        (1, Some("▁док")) => vec![("тор", 0.0), ("ер", -7.3), ("<blk>", -9.0)],
+        _ => doctor(t, last),
+      }
+    }
+    assert_eq!(run(&Script { script: far, durations: 0 }, 4, &["докер"]), "доктор мир");
   }
 
   #[test]

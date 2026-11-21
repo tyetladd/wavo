@@ -719,7 +719,7 @@ impl Model {
 
     let mut transcript = match &self.family {
       Family::Gigaam(m) => m.transcribe(pcm, options.hotwords.as_ref())?,
-      Family::Parakeet(m) => m.transcribe(pcm)?,
+      Family::Parakeet(m) => m.transcribe(pcm, options.hotwords.as_ref())?,
       Family::Whisper(m) => {
         let (mut t, i) = m.transcribe(pcm, language)?;
         t.language = i.map(|i| self.languages[i].clone());
@@ -957,9 +957,8 @@ impl Model {
     self.language_tokens() || self.languages.len() == 1
   }
 
-  /// Whether [`Options::hotwords`] changes how the model decodes: true for GigaAM's CTC models
-  /// (`gigaam-v3-e2e-ctc`, `gigaam-v3-ctc`, `gigaam-multilingual-large-ctc`), false for the
-  /// others, which ignore them.
+  /// Whether [`Options::hotwords`] changes how the model decodes: true for GigaAM (CTC and
+  /// RNN-T) and Parakeet (TDT), false for the others (Whisper, Moonshine), which ignore them.
   ///
   /// # Examples
   ///
@@ -969,7 +968,11 @@ impl Model {
   /// # Ok::<(), wavo::Error>(())
   /// ```
   pub fn takes_hotwords(&self) -> bool {
-    matches!(&self.family, Family::Gigaam(m) if m.takes_hotwords())
+    match &self.family {
+      Family::Gigaam(m) => m.takes_hotwords(),
+      Family::Parakeet(_) => true,
+      _ => false,
+    }
   }
 
   /// Whether the model has a token per language to be told one with: multilingual Whisper.

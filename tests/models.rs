@@ -413,6 +413,7 @@ fn gigaam_v3_e2e_rnnt() {
   check("gigaam-v3-e2e-rnnt", GIGAAM);
   too_long("gigaam-v3-e2e-rnnt", "ru-long");
   long("gigaam-v3-e2e-rnnt", "ru", false);
+  hotwords_unheard("gigaam-v3-e2e-rnnt", GIGAAM);
 }
 
 #[test]
@@ -530,6 +531,7 @@ fn parakeet_tdt_v3() {
 #[test]
 fn parakeet_ultra() {
   check("parakeet-ultra", &["jfk", "ru-short", "uk-long", "jobs-silence"]);
+  hotwords_unheard("parakeet-ultra", &["jfk", "ru-short", "uk-long"]);
 }
 
 #[test]

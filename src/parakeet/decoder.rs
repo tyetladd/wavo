@@ -102,6 +102,27 @@ impl Decoder {
     })
   }
 
+  /// [`Decoder::decode`]'s search with the bonus of `trie` ([`crate::hotwords::transducer`]),
+  /// at most `max_symbols` tokens a frame however the budget is counted.
+  pub fn beam(
+    &self,
+    enc: &[f32],
+    width: usize,
+    texts: &[Vec<char>],
+    trie: &crate::hotwords::Trie,
+    boost: f32,
+    beam: usize,
+  ) -> Vec<(u32, u32)> {
+    let steps = crate::hotwords::Steps {
+      blank: self.blank,
+      durations: &self.durations,
+      max_symbols: self.max_symbols,
+    };
+    let model = Beam { decoder: self, enc, width };
+    let frames = enc.len() / width;
+    crate::hotwords::transducer(&model, frames, &steps, texts, trie, boost, beam)
+  }
+
   /// One step of the LSTM layers from `state` (per layer h, then c) on the embedding of `token`,
   /// or zeros. Returns the next state and the joint's predictor projection of the top h.
   fn predict(&self, token: Option<usize>, state: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -135,6 +156,76 @@ impl Decoder {
     let logits: Vec<f32> = d.iter().zip(&self.out_b).map(|(d, b)| d + b).collect();
     let (tokens, durations) = logits.split_at(self.classes);
     (argmax(tokens), argmax(durations))
+  }
+}
+
+/// The predictor and joint over one clip's `enc`, for the beam search. A state is the LSTM
+/// layers' h and c.
+struct Beam<'a> {
+  decoder: &'a Decoder,
+  enc: &'a [f32],
+  width: usize,
+}
+
+impl crate::hotwords::Transducer for Beam<'_> {
+  type State = Vec<f32>;
+
+  fn start(&self) -> (Vec<f32>, Vec<f32>) {
+    let d = self.decoder;
+    d.predict(None, &vec![0.0; 2 * d.lstm.len() * d.hidden])
+  }
+
+  fn step(&self, state: &Vec<f32>, token: usize) -> (Vec<f32>, Vec<f32>) {
+    self.decoder.predict(Some(token), state)
+  }
+
+  /// The LSTM layers and the joint's projection for all `steps`, each matrix read once for all.
+  fn steps(&self, steps: &[(&Vec<f32>, usize)]) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let (d, n) = (self.decoder, self.decoder.hidden);
+    let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+    let mut xs: Vec<Vec<f32>> = steps.iter().map(|&(_, token)| d.embed.row(token)).collect();
+    let mut next: Vec<Vec<f32>> = steps.iter().map(|(s, _)| vec![0.0; s.len()]).collect();
+    for (l, layer) in d.lstm.iter().enumerate() {
+      let hs: Vec<&[f32]> = steps.iter().map(|(s, _)| &s[2 * n * l..][..n]).collect();
+      let x: Vec<&[f32]> = xs.iter().map(Vec::as_slice).collect();
+      let (gx, gh) =
+        (crate::cpu::matvec_each(&layer.wx, &x), crate::cpu::matvec_each(&layer.wh, &hs));
+      for (k, ((s, _), out)) in steps.iter().zip(&mut next).enumerate() {
+        let c = &s[2 * n * l + n..][..n];
+        let gate = |i: usize| gx[k][i] + gh[k][i] + layer.bias[i];
+        let (nh, nc) = out[2 * n * l..][..2 * n].split_at_mut(n);
+        for j in 0..n {
+          let (i, f, g, o) = (gate(j), gate(n + j), gate(2 * n + j), gate(3 * n + j));
+          nc[j] = sigmoid(f) * c[j] + sigmoid(i) * g.tanh();
+          nh[j] = sigmoid(o) * nc[j].tanh();
+        }
+        xs[k] = nh.to_vec();
+      }
+    }
+    let x: Vec<&[f32]> = xs.iter().map(Vec::as_slice).collect();
+    let preds = crate::cpu::matvec_each(&d.pred_w, &x);
+    (next.into_iter().zip(preds))
+      .map(|(s, p)| (s, p.iter().zip(&d.pred_b).map(|(p, b)| p + b).collect()))
+      .collect()
+  }
+
+  /// Log probabilities of the tokens and, apart, of the durations.
+  fn joint(&self, t: usize, preds: &[&[f32]]) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let d = self.decoder;
+    let enc = &self.enc[t * self.width..][..d.joint];
+    let zs: Vec<Vec<f32>> = (preds.iter())
+      .map(|pred| enc.iter().zip(*pred).map(|(e, p)| (e + p).max(0.0)).collect())
+      .collect();
+    let zs: Vec<&[f32]> = zs.iter().map(Vec::as_slice).collect();
+    (crate::cpu::matvec_each(&d.out_w, &zs).into_iter())
+      .map(|o| {
+        let mut logits: Vec<f32> = o.iter().zip(&d.out_b).map(|(o, b)| o + b).collect();
+        let mut durations = logits.split_off(d.classes);
+        crate::hotwords::log_softmax(&mut logits);
+        crate::hotwords::log_softmax(&mut durations);
+        (logits, durations)
+      })
+      .collect()
   }
 }
 
