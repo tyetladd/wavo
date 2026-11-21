@@ -32,7 +32,8 @@ pub struct Hotwords {
   /// about 2 the decoder writes them over common words that sound alike (`доке` as `докере`).
   /// Default 1.5.
   pub boost: f32,
-  /// Hypotheses kept per frame, at least 1. Default 8.
+  /// Hypotheses kept per frame, at least 1, and half as many again of the likeliest without the
+  /// bonus of unfinished words. Default 8.
   pub beam: usize,
 }
 
@@ -182,7 +183,31 @@ struct Hyp {
   /// Log probabilities of the prefix ending in a blank and in its last token.
   blank: f32,
   token: f32,
+  /// The frame its likelier path emitted the last token on.
+  since: u32,
 }
+
+impl Hyp {
+  fn new(prefix: u32) -> Self {
+    Hyp { prefix, blank: f32::NEG_INFINITY, token: f32::NEG_INFINITY, since: 0 }
+  }
+
+  /// A path ending in a blank (`blank`) or in the last token, of log probability `p`, whose last
+  /// token was emitted on frame `since`.
+  fn take(&mut self, blank: bool, p: f32, since: u32) {
+    if p > add(self.blank, self.token) {
+      self.since = since;
+    }
+    let to = if blank { &mut self.blank } else { &mut self.token };
+    *to = add(*to, p);
+  }
+}
+
+/// Frames a word's partial bonus fully counts for after its last letter; then half as much per
+/// frame. Without it a hypothesis that stops in a word's middle could stay on blanks over the
+/// next words (`парак…верь` for `паракет и проверь`) and push the others out of the beam
+/// before it pays the bonus back. A model's letters come a few frames apart.
+const GRACE: u32 = 3;
 
 /// How far below a frame's best logit a token is still tried, at least: past it a token needs a
 /// bonus no piece gets.
@@ -211,13 +236,14 @@ pub(crate) fn ctc(
   let beam = beam.max(1);
   let mut prefixes = vec![Prefix { parent: ROOT, token: ROOT, ctx: Ctx::START, bonus: 0.0 }];
   let mut children: std::collections::HashMap<(u32, u32), u32> = Default::default();
-  let mut beams = vec![Hyp { prefix: 0, blank: 0.0, token: f32::NEG_INFINITY }];
+  let mut beams = vec![Hyp { blank: 0.0, ..Hyp::new(0) }];
   let mut order: Vec<usize> = Vec::with_capacity(classes);
   let longest = texts.iter().map(Vec::len).max().unwrap_or(0);
   let prune = PRUNE.max(boost * longest as f32);
   let mut next: Vec<Hyp> = Vec::new();
 
-  for logits in logits.chunks_exact(classes) {
+  for (t, logits) in logits.chunks_exact(classes).enumerate() {
+    let t = t as u32;
     // Raw logits: every alignment takes one entry of each row, so a row's log-softmax would
     // shift them all alike.
     let row = logits;
@@ -236,7 +262,7 @@ pub(crate) fn ctc(
     {
       Some(i) => i,
       None => {
-        next.push(Hyp { prefix, blank: f32::NEG_INFINITY, token: f32::NEG_INFINITY });
+        next.push(Hyp::new(prefix));
         next.len() - 1
       }
     };
@@ -244,9 +270,9 @@ pub(crate) fn ctc(
       let total = add(h.blank, h.token);
       let last = prefixes[h.prefix as usize].token;
       let i = slot(h.prefix, &mut next);
-      next[i].blank = add(next[i].blank, total + row[blank]);
+      next[i].take(true, total + row[blank], h.since);
       if last != ROOT {
-        next[i].token = add(next[i].token, h.token + row[last as usize]);
+        next[i].take(false, h.token + row[last as usize], h.since);
       }
       for &c in &order[..top] {
         if c == blank {
@@ -262,21 +288,30 @@ pub(crate) fn ctc(
         // A repeat of the last token extends the prefix only across a blank.
         let from = if c as u32 == last { h.blank } else { total };
         let i = slot(child, &mut next);
-        next[i].token = add(next[i].token, from + row[c]);
+        next[i].take(false, from + row[c], t);
       }
     }
-    let score = |h: &Hyp| add(h.blank, h.token) + prefixes[h.prefix as usize].bonus;
-    next.sort_by(|a, b| score(b).total_cmp(&score(a)).then(a.prefix.cmp(&b.prefix)));
-    next.truncate(beam);
+    // Ranked with the bonus of the words being spelled, so that a hotword survives until its
+    // end; and the best as if decoding stopped here, so that the words a partial bonus would
+    // crowd out (greedy's, mostly) do too.
+    let settled = |h: &Hyp| {
+      let p = &prefixes[h.prefix as usize];
+      add(h.blank, h.token) + p.bonus - p.ctx.open()
+    };
+    let score = |h: &Hyp| {
+      let p = &prefixes[h.prefix as usize];
+      let late = (t - h.since).saturating_sub(GRACE).min(30) as i32;
+      settled(h) + p.ctx.open() * 0.5f32.powi(late)
+    };
+    next.sort_by(|a, b| settled(b).total_cmp(&settled(a)).then(a.prefix.cmp(&b.prefix)));
+    let sure = (beam / 2).max(1).min(next.len());
+    next[sure..].sort_by(|a, b| score(b).total_cmp(&score(a)).then(a.prefix.cmp(&b.prefix)));
+    next.truncate(beam + sure);
     std::mem::swap(&mut beams, &mut next);
   }
 
-  // The last word's bonus counts only if it ended a word.
-  let fin = |h: &Hyp| {
-    let p = &prefixes[h.prefix as usize];
-    add(h.blank, h.token) + p.bonus - p.ctx.open()
-  };
-  let best = beams.iter().max_by(|a, b| fin(a).total_cmp(&fin(b)).then(b.prefix.cmp(&a.prefix)));
+  // The last word's bonus counts only if it ended a word: the beam's first is the best so.
+  let best = beams.first();
   let mut tokens = Vec::new();
   let mut p = best.map_or(0, |h| h.prefix);
   while p != 0 {
@@ -284,6 +319,15 @@ pub(crate) fn ctc(
     p = prefixes[p as usize].parent;
   }
   tokens.reverse();
+  // A lone `▁` before a word that starts with its own is an empty word: the model writes one
+  // before Latin letters, and the bonus may have spelled the word in Cyrillic.
+  let space = |id: u32| texts[id as usize] == ['▁'];
+  let starts = |id: u32| texts[id as usize].first() == Some(&'▁');
+  let kept: Vec<u32> = (0..tokens.len())
+    .filter(|&i| !(space(tokens[i]) && tokens.get(i + 1).is_some_and(|&n| starts(n))))
+    .map(|i| tokens[i])
+    .collect();
+  let tokens = kept;
   let frames = align(logits, classes, blank, &tokens);
   tokens.into_iter().zip(frames).collect()
 }
@@ -425,6 +469,42 @@ mod tests {
     // And the beam doesn't stop on a hotword's prefix: "док" alone isn't a word end.
     let l = logits(&[&[("▁док", -0.1)], &[("<blk>", -0.1)]]);
     assert_eq!(decode(&l, &["докер"], 1.0), "док");
+  }
+
+  #[test]
+  fn an_unfinished_word_drops_no_words_after_it() {
+    // "▁док" starts the hotword, the next letters don't follow it, and blanks are close behind
+    // each token: a hypothesis holding "док"'s partial bonus over blanks would drop "ор при мир".
+    let l = logits(&[
+      &[("▁док", -0.1)],
+      &[("ор", -0.1), ("<blk>", -1.0)],
+      &[("▁при", -0.1), ("<blk>", -1.0)],
+      &[("вет", -0.1), ("<blk>", -1.0)],
+      &[("▁мир", -0.1), ("<blk>", -1.0)],
+      &[("<blk>", -0.1)],
+    ]);
+    let words = vec!["докер".to_string()];
+    for beam in [1, 2, 8] {
+      let ids = ctc(&l, VOCAB.len(), 0, &texts(), &Trie::new(&words), 1.5, beam);
+      let text: String = ids.iter().map(|&(id, _)| VOCAB[id as usize]).collect();
+      assert_eq!(text.replace('▁', " ").trim(), "докор привет мир", "beam {beam}");
+    }
+  }
+
+  #[test]
+  fn a_lone_space_before_a_word_goes() {
+    let vocab = ["<blk>", "▁", "▁до", "к", "ер", "D"];
+    let texts: Vec<Vec<char>> = vocab.iter().map(|p| p.chars().collect()).collect();
+    let mut l = vec![-20.0f32; 4 * vocab.len()];
+    for (t, row) in
+      [&[(1, -0.1)][..], &[(5, -0.5), (2, -1.0)], &[(3, -0.1)], &[(4, -0.1)]].iter().enumerate()
+    {
+      row.iter().for_each(|&(id, lp)| l[t * vocab.len() + id] = lp);
+    }
+    let trie = Trie::new(&["докер".to_string()]);
+    let ids: Vec<u32> =
+      ctc(&l, vocab.len(), 0, &texts, &trie, 1.5, 8).iter().map(|t| t.0).collect();
+    assert_eq!(ids, [2, 3, 4]);
   }
 
   #[test]

@@ -403,7 +403,8 @@ pub struct Options {
   /// [`Error::AudioTooLong`]. `transcribe_with` ignores it.
   pub window_ms: Option<u32>,
   /// Words the decoder favours over what it would write otherwise: see [`Hotwords`]. `None`,
-  /// the default, or no words decodes greedily, as before. Only models whose
+  /// the default, or no words decodes greedily, as before; words the audio doesn't come near
+  /// leave the transcript as greedy writes it. Only models whose
   /// [`takes_hotwords`](Model::takes_hotwords) is true use them (GigaAM's CTC models, decoded
   /// with a prefix beam search); the others ignore them.
   pub hotwords: Option<Hotwords>,
